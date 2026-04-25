@@ -1,0 +1,16 @@
+.DS_Store
+*.pyc
+__pycache__/
+
+# Local skill installation outputs.
+.agents/
+.claude/
+skills-lock.json
+
+# Local-only notes and environment files.
+AGENTS.md
+AGENTS.local.md
+CLAUDE.md
+CLAUDE.local.md
+.env
+.env.*
