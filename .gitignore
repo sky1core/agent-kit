@@ -5,12 +5,19 @@ __pycache__/
 # Local skill installation outputs.
 .agents/
 .claude/
+.kiro/
 skills-lock.json
 
+# Local backup files.
+.bak
+.bak.*
+*.bak
+*.bak.*
+
 # Local-only notes and environment files.
+local/
 AGENTS.md
-AGENTS.local.md
 CLAUDE.md
-CLAUDE.local.md
+*.local.md
 .env
 .env.*

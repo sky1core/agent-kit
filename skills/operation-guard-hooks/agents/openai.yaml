@@ -1,0 +1,4 @@
+interface:
+  display_name: "Operation Guard Hooks"
+  short_description: "Block or gate dangerous agent and Git ops."
+  default_prompt: "Use $operation-guard-hooks to set up or review hook-based guards for agent tool calls or Git push/amend safety."

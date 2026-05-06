@@ -1,0 +1,4 @@
+interface:
+  display_name: "Security Scanners"
+  short_description: "Scan for secrets and vulnerable deps."
+  default_prompt: "Use $security-scanners to configure or review manual or hook-based scans for secrets and dependency vulnerabilities."
