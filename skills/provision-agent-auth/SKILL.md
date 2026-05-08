@@ -1,6 +1,6 @@
 ---
 name: provision-agent-auth
-version: 1.0.0
+version: 1.0.1
 description: >
   Docker, VM, remote sandbox 같은 격리 환경에서 Claude Code, Codex, Gemini,
   Kiro CLI 에이전트 테스트를 바로 실행할 수 있도록 최소 인증 bundle을 만들고
