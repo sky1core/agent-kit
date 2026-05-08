@@ -29,6 +29,7 @@ class Artifact:
     bundle: str
     required: bool
     macos_keychain_service: str | None = None
+    target_hints: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,10 @@ ARTIFACTS: dict[str, list[Artifact]] = {
             ),
             "home/.local/share/kiro-cli/data.sqlite3",
             True,
+            target_hints=(
+                ".local/share/kiro-cli/data.sqlite3",
+                "Library/Application Support/kiro-cli/data.sqlite3",
+            ),
         ),
     ],
 }
@@ -145,6 +150,12 @@ def artifact_source_labels(artifact: Artifact) -> list[str]:
     if artifact.macos_keychain_service:
         labels.append(f"macos-keychain:{artifact.macos_keychain_service}")
     return labels
+
+
+def artifact_target_hints(artifact: Artifact) -> list[str]:
+    if artifact.target_hints is not None:
+        return list(artifact.target_hints)
+    return [artifact.bundle.removeprefix("home/")]
 
 
 def source_home_is_current_user(source_home: Path) -> bool:
@@ -301,7 +312,8 @@ def build_manifest(args: argparse.Namespace, output_dir: Path | None) -> dict[st
         item = {
             "sources": artifact_source_labels(artifact),
             "bundle": artifact.bundle,
-            "target_hint": artifact.bundle.removeprefix("home/"),
+            "target_hint": artifact_target_hints(artifact)[0],
+            "target_hints": artifact_target_hints(artifact),
             "required": artifact.required,
         }
 

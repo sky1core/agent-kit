@@ -90,7 +90,7 @@ script는 하지 않는다:
 | Claude Code CLI | Required: `.claude/.credentials.json` file, 또는 macOS Keychain generic password service `Claude Code-credentials`. Alternative: `CLAUDE_CODE_OAUTH_TOKEN`의 setup-token. Optional: `.claude.json` app state/config. | `home/.claude/.credentials.json`, `home/.claude.json` | `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json`, `$HOME/.claude.json`, 또는 command/session env `CLAUDE_CODE_OAUTH_TOKEN` | `claude auth status --text` |
 | Codex CLI | Required: `.codex/auth.json` | `home/.codex/auth.json` | `${CODEX_HOME:-$HOME/.codex}/auth.json` | `codex login status`는 local smoke일 뿐이다. 실제 auth 증명은 user-approved minimal Codex call을 사용한다. |
 | Gemini CLI | Required: `.gemini/oauth_creds.json`. Generated: `security.auth.selectedType=oauth-personal`을 가진 최소 `.gemini/settings.json`. | `home/.gemini/oauth_creds.json`, `home/.gemini/settings.json` | `$HOME/.gemini/oauth_creds.json`, `$HOME/.gemini/settings.json` | `gemini -p "Reply with OK only." --output-format json`; 실제 model call을 검증한다. |
-| Kiro CLI | Required: `.local/share/kiro-cli/data.sqlite3`, 또는 해당 file이 필요한 auth state를 포함한다면 macOS `Library/Application Support/kiro-cli/data.sqlite3`. | `home/.local/share/kiro-cli/data.sqlite3` | `$HOME/.local/share/kiro-cli/data.sqlite3` | `kiro-cli whoami --format json`; non-null account가 필요하다. |
+| Kiro CLI | Required: `.local/share/kiro-cli/data.sqlite3`, 또는 해당 file이 필요한 auth state를 포함한다면 macOS `Library/Application Support/kiro-cli/data.sqlite3`. | `home/.local/share/kiro-cli/data.sqlite3` | Linux/container: `$HOME/.local/share/kiro-cli/data.sqlite3`; macOS: `$HOME/Library/Application Support/kiro-cli/data.sqlite3` | `kiro-cli whoami --format json`; `email`, `accountType`, `region`, `startUrl` 같은 account field 중 하나 이상이 non-null이어야 한다. |
 
 존재하는 artifact만 사용한다. Required artifact가 없으면 새로 꾸며내지 않는다. target 환경에서 공식 login/device-code flow를 실행하거나 먼저 유효한 source snapshot을 만든다.
 
@@ -106,7 +106,7 @@ Runtime별 주의:
 - macOS Claude Code는 subscription OAuth credential을 Keychain에 저장한다. `--claude-keychain-account`가 없으면 `scripts/build_bundle.py`는 현재 OS user의 `Claude Code-credentials` service만 읽는다.
 - Codex `auth.json`은 OAuth refresh token을 포함할 수 있으며, 다른 Codex home이 token을 refresh하는 동안 복사하면 stale해질 수 있다. `auth.json`이 malformed여도 `codex login status`가 false-positive local smoke가 될 수 있으므로 full auth proof로 보고하지 않는다.
 - Gemini OAuth는 `oauth_creds.json`과 auth method setting이 모두 필요하다. 관련 없는 local path나 tool config가 들어 있을 수 있는 사용자 전체 `.gemini/settings.json`을 복사하지 말고 최소 settings file을 생성한다.
-- Kiro의 문서화된 sandbox persistence path는 `$HOME/.local/share/kiro-cli/data.sqlite3`다. 애매하면 host state를 복사하지 말고 target에서 `kiro-cli login --use-device-flow`를 실행한다.
+- Kiro의 Linux/container persistence path는 `$HOME/.local/share/kiro-cli/data.sqlite3`다. macOS target에서는 `$HOME/Library/Application Support/kiro-cli/data.sqlite3`를 사용한다. macOS target에서 `.local/share`에만 배치하면 `kiro-cli whoami --format json`이 auth state를 읽지 못할 수 있다. 애매하면 host state를 복사하지 말고 target에서 `kiro-cli login --use-device-flow`를 실행한다.
 
 ## 인증 bundle 생성
 
@@ -153,7 +153,7 @@ agent-auth-bundle/
   manifest.json
 ```
 
-`manifest.json`에는 copied/missing 목록, required flag, destination path, file mode, verification hint만 들어간다. auth file content, token value, credential-bearing URL, local machine identifier를 포함하면 안 된다. runtime은 해당 manifest entry가 `"complete": true`일 때만 사용할 수 있다.
+`manifest.json`에는 copied/missing 목록, required flag, target path hint, file mode, verification hint만 들어간다. auth file content, token value, credential-bearing URL, local machine identifier를 포함하면 안 된다. runtime은 해당 manifest entry가 `"complete": true`일 때만 사용할 수 있다.
 
 ## 대상 환경 배치
 
@@ -194,6 +194,16 @@ docker run --rm \
   --mount "type=bind,src=/tmp/agent-auth-bundle/home/.local/share/kiro-cli/data.sqlite3,dst=/auth/kiro-data.sqlite3,readonly" \
   <kiro-image> \
   sh -lc 'mkdir -p "$HOME/.local/share/kiro-cli" && cp /auth/kiro-data.sqlite3 "$HOME/.local/share/kiro-cli/data.sqlite3" && chmod 600 "$HOME/.local/share/kiro-cli/data.sqlite3" && kiro-cli whoami --format json'
+```
+
+Kiro macOS target pattern:
+
+```bash
+mkdir -p "$HOME/Library/Application Support/kiro-cli"
+cp /tmp/agent-auth-bundle/home/.local/share/kiro-cli/data.sqlite3 \
+  "$HOME/Library/Application Support/kiro-cli/data.sqlite3"
+chmod 600 "$HOME/Library/Application Support/kiro-cli/data.sqlite3"
+kiro-cli whoami --format json
 ```
 
 target image/container의 이름과 신뢰성이 확인되지 않았으면 Docker pattern을 사용하지 않는다.
