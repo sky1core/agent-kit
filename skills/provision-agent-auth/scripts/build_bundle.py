@@ -30,6 +30,7 @@ class Artifact:
     required: bool
     macos_keychain_service: str | None = None
     target_hints: tuple[str, ...] | None = None
+    target_os_hints: tuple[tuple[str, str], ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,10 @@ ARTIFACTS: dict[str, list[Artifact]] = {
             target_hints=(
                 ".local/share/kiro-cli/data.sqlite3",
                 "Library/Application Support/kiro-cli/data.sqlite3",
+            ),
+            target_os_hints=(
+                ("linux-container", ".local/share/kiro-cli/data.sqlite3"),
+                ("macos", "Library/Application Support/kiro-cli/data.sqlite3"),
             ),
         ),
     ],
@@ -156,6 +161,12 @@ def artifact_target_hints(artifact: Artifact) -> list[str]:
     if artifact.target_hints is not None:
         return list(artifact.target_hints)
     return [artifact.bundle.removeprefix("home/")]
+
+
+def artifact_target_os_hints(artifact: Artifact) -> dict[str, str]:
+    if artifact.target_os_hints is None:
+        return {}
+    return dict(artifact.target_os_hints)
 
 
 def source_home_is_current_user(source_home: Path) -> bool:
@@ -316,6 +327,9 @@ def build_manifest(args: argparse.Namespace, output_dir: Path | None) -> dict[st
             "target_hints": artifact_target_hints(artifact),
             "required": artifact.required,
         }
+        target_os_hints = artifact_target_os_hints(artifact)
+        if target_os_hints:
+            item["target_os_hints"] = target_os_hints
 
         runtime_entry = runtime_data[runtime]
         assert isinstance(runtime_entry, dict)

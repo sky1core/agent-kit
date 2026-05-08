@@ -73,15 +73,16 @@ script는 하지 않는다:
 
 ## 작업 절차
 
-1. 대상 환경을 확인한다: Docker container/image, VM, SSH host, remote sandbox, 또는 bundle 출력 경로.
+1. 대상 환경과 target OS를 확인한다: Docker/Linux container, Linux VM, macOS VM/host, SSH host, remote sandbox, 또는 bundle 출력 경로.
 2. 대상 runtime을 확정한다: `claude-code`, `codex`, `gemini`, `kiro`.
-3. artifact 표를 기준으로 계획을 보고한다. 파일 내용이나 token 값은 출력하지 않는다.
-4. dry-run으로 source 존재 여부만 확인한다.
-5. 사용자가 계획을 승인하면 bundle을 만든다.
-6. bundle을 대상 환경 안의 대응 경로에 배치한다.
-7. 대상 환경 안에서 auth/status 또는 읽기 전용 smoke command를 실행한다.
-8. 성공/실패, 배치 경로, env key 이름, 검증 명령만 보고한다.
-9. 임시 bundle은 정리한다. 사용자가 유지하라고 한 경우에만 경로를 남긴다.
+3. Kiro를 다룰 때는 target이 Linux/container인지 macOS인지 먼저 확정한다.
+4. artifact 표를 기준으로 계획을 보고한다. 파일 내용이나 token 값은 출력하지 않는다.
+5. dry-run으로 source 존재 여부만 확인한다.
+6. 사용자가 계획을 승인하면 bundle을 만든다.
+7. bundle을 target OS에 맞는 대응 경로에 배치한다.
+8. 대상 환경 안에서 auth/status 또는 읽기 전용 smoke command를 실행한다.
+9. 성공/실패, 배치 경로, env key 이름, 검증 명령만 보고한다.
+10. 임시 bundle은 정리한다. 사용자가 유지하라고 한 경우에만 경로를 남긴다.
 
 ## 인증 artifact
 
@@ -153,11 +154,11 @@ agent-auth-bundle/
   manifest.json
 ```
 
-`manifest.json`에는 copied/missing 목록, required flag, target path hint, file mode, verification hint만 들어간다. auth file content, token value, credential-bearing URL, local machine identifier를 포함하면 안 된다. runtime은 해당 manifest entry가 `"complete": true`일 때만 사용할 수 있다.
+`manifest.json`에는 copied/missing 목록, required flag, target path hint, target OS별 path hint, file mode, verification hint만 들어간다. auth file content, token value, credential-bearing URL, local machine identifier를 포함하면 안 된다. runtime은 해당 manifest entry가 `"complete": true`일 때만 사용할 수 있다.
 
 ## 대상 환경 배치
 
-target의 일반 file transfer mechanism으로 bundle contents를 target 환경에 배치한다. 가능하면 mount는 read-only로 유지한다.
+target의 일반 file transfer mechanism으로 bundle contents를 target 환경에 배치한다. 가능하면 mount는 read-only로 유지한다. 배치 경로는 source host가 아니라 target OS 기준으로 선택한다.
 
 Codex Docker pattern:
 
@@ -187,7 +188,7 @@ docker run --rm \
   sh -lc 'mkdir -p "$HOME/.gemini" && cp /auth/gemini/oauth_creds.json "$HOME/.gemini/oauth_creds.json" && cp /auth/gemini/settings.json "$HOME/.gemini/settings.json" && chmod 600 "$HOME/.gemini/oauth_creds.json" "$HOME/.gemini/settings.json" && gemini -p "Reply with OK only." --output-format json'
 ```
 
-Kiro Docker pattern:
+Kiro Linux/container target pattern:
 
 ```bash
 docker run --rm \
@@ -196,7 +197,7 @@ docker run --rm \
   sh -lc 'mkdir -p "$HOME/.local/share/kiro-cli" && cp /auth/kiro-data.sqlite3 "$HOME/.local/share/kiro-cli/data.sqlite3" && chmod 600 "$HOME/.local/share/kiro-cli/data.sqlite3" && kiro-cli whoami --format json'
 ```
 
-Kiro macOS target pattern:
+Kiro macOS VM/host target pattern:
 
 ```bash
 mkdir -p "$HOME/Library/Application Support/kiro-cli"
