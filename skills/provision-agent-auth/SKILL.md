@@ -1,6 +1,6 @@
 ---
 name: provision-agent-auth
-version: 1.0.1
+version: 1.0.2
 description: >
   Docker, VM, remote sandbox 같은 격리 환경에서 Claude Code, Codex, Gemini,
   Kiro CLI 에이전트 테스트를 바로 실행할 수 있도록 최소 인증 bundle을 만들고
@@ -22,6 +22,14 @@ description: >
 
 - Python 3.9+ when using `scripts/build_bundle.py`.
 - macOS `security` CLI when exporting Claude Code from Keychain.
+- 대상 환경에는 선택한 runtime CLI가 먼저 설치되어 있어야 한다. 이 스킬은 CLI 설치를 수행하지 않고 auth state만 준비한다.
+
+Runtime CLI 설치 reference:
+
+- Claude Code: `https://code.claude.com/docs/en/setup`
+- Codex CLI: `https://help.openai.com/en/articles/11096431-openai-codex-ci-getting-started`
+- Gemini CLI: `https://google-gemini.github.io/gemini-cli/docs/get-started/`
+- Kiro CLI: `https://kiro.dev/docs/cli/installation/`
 
 ## 경계
 
@@ -166,7 +174,13 @@ Codex Docker pattern:
 docker run --rm \
   --mount "type=bind,src=/tmp/agent-auth-bundle/home/.codex/auth.json,dst=/auth/codex-auth.json,readonly" \
   <codex-image> \
-  sh -lc 'mkdir -p "${CODEX_HOME:-$HOME/.codex}" && cp /auth/codex-auth.json "${CODEX_HOME:-$HOME/.codex}/auth.json" && chmod 600 "${CODEX_HOME:-$HOME/.codex}/auth.json" && codex login status'
+  sh -eu -c '
+    codex_home="${CODEX_HOME:-$HOME/.codex}"
+    mkdir -p "$codex_home"
+    cp /auth/codex-auth.json "$codex_home/auth.json"
+    chmod 600 "$codex_home/auth.json"
+    codex login status
+  '
 ```
 
 `.claude/.credentials.json`과 `.claude.json`이 모두 복사된 Claude Code Docker pattern:
@@ -176,7 +190,13 @@ docker run --rm \
   --mount "type=bind,src=/tmp/agent-auth-bundle/home/.claude.json,dst=/auth/.claude.json,readonly" \
   --mount "type=bind,src=/tmp/agent-auth-bundle/home/.claude/.credentials.json,dst=/auth/.credentials.json,readonly" \
   <claude-image> \
-  sh -lc 'mkdir -p "$HOME/.claude" && cp /auth/.claude.json "$HOME/.claude.json" && cp /auth/.credentials.json "$HOME/.claude/.credentials.json" && chmod 600 "$HOME/.claude.json" "$HOME/.claude/.credentials.json" && claude auth status --text'
+  sh -eu -c '
+    mkdir -p "$HOME/.claude"
+    cp /auth/.claude.json "$HOME/.claude.json"
+    cp /auth/.credentials.json "$HOME/.claude/.credentials.json"
+    chmod 600 "$HOME/.claude.json" "$HOME/.claude/.credentials.json"
+    claude auth status --text
+  '
 ```
 
 Gemini Docker pattern:
@@ -185,25 +205,39 @@ Gemini Docker pattern:
 docker run --rm \
   --mount "type=bind,src=/tmp/agent-auth-bundle/home/.gemini,dst=/auth/gemini,readonly" \
   <gemini-image> \
-  sh -lc 'mkdir -p "$HOME/.gemini" && cp /auth/gemini/oauth_creds.json "$HOME/.gemini/oauth_creds.json" && cp /auth/gemini/settings.json "$HOME/.gemini/settings.json" && chmod 600 "$HOME/.gemini/oauth_creds.json" "$HOME/.gemini/settings.json" && gemini -p "Reply with OK only." --output-format json'
+  sh -eu -c '
+    mkdir -p "$HOME/.gemini"
+    cp /auth/gemini/oauth_creds.json "$HOME/.gemini/oauth_creds.json"
+    cp /auth/gemini/settings.json "$HOME/.gemini/settings.json"
+    chmod 600 "$HOME/.gemini/oauth_creds.json" "$HOME/.gemini/settings.json"
+    gemini -p "Reply with OK only." --output-format json
+  '
 ```
 
 Kiro Linux/container target pattern:
+
+target에 `kiro-cli`가 이미 설치되어 있고 `PATH`에서 실행 가능해야 한다.
 
 ```bash
 docker run --rm \
   --mount "type=bind,src=/tmp/agent-auth-bundle/home/.local/share/kiro-cli/data.sqlite3,dst=/auth/kiro-data.sqlite3,readonly" \
   <kiro-image> \
-  sh -lc 'mkdir -p "$HOME/.local/share/kiro-cli" && cp /auth/kiro-data.sqlite3 "$HOME/.local/share/kiro-cli/data.sqlite3" && chmod 600 "$HOME/.local/share/kiro-cli/data.sqlite3" && kiro-cli whoami --format json'
+  sh -eu -c '
+    kiro_data="$HOME/.local/share/kiro-cli/data.sqlite3"
+    mkdir -p "$(dirname "$kiro_data")"
+    cp /auth/kiro-data.sqlite3 "$kiro_data"
+    chmod 600 "$kiro_data"
+    kiro-cli whoami --format json
+  '
 ```
 
 Kiro macOS VM/host target pattern:
 
 ```bash
-mkdir -p "$HOME/Library/Application Support/kiro-cli"
-cp /tmp/agent-auth-bundle/home/.local/share/kiro-cli/data.sqlite3 \
-  "$HOME/Library/Application Support/kiro-cli/data.sqlite3"
-chmod 600 "$HOME/Library/Application Support/kiro-cli/data.sqlite3"
+kiro_data="$HOME/Library/Application Support/kiro-cli/data.sqlite3"
+mkdir -p "$(dirname "$kiro_data")"
+cp /tmp/agent-auth-bundle/home/.local/share/kiro-cli/data.sqlite3 "$kiro_data"
+chmod 600 "$kiro_data"
 kiro-cli whoami --format json
 ```
 

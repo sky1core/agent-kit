@@ -1,6 +1,6 @@
 ---
 name: security-scanners
-version: 1.0.0
+version: 1.0.19
 description: >
   파일, staged changes, push되는 commit range, source tree, dependency
   lockfile에서 secret과 vulnerability를 검사하는 security scanner를 설정,
@@ -40,5 +40,9 @@ secret 또는 dependency vulnerability에 대한 수동 scan이나 hook 기반 s
 - hook 배치는 선택적 자동화일 뿐, 이 skill의 정체성이 아니다.
 - project가 의도적으로 opt-in하지 않는 한 ignored build output은 scan하지 않는다.
 - SBOM 생성 자체를 vulnerability gate로 취급하지 않는다.
+- gitleaks finding을 agent가 false positive라고 자의 판단해서 allowlist,
+  baseline, regex exception, config ignore로 허용하지 않는다. allowlist는 사용자가
+  값/패턴/파일 경로와 위험을 명시 승인한 경우에만 repo-local config로 추가한다.
+  기본 대응은 secret 제거, placeholder 교체, ignored local file 이동이다.
 - 사용자가 해당 1회 bypass를 명시 승인하지 않는 한 scanner 실패를
   `--no-verify`로 우회하지 않는다.
