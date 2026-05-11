@@ -27,7 +27,23 @@ Global hook body를 repo-local `core.hooksPath`로 대체하지 않는다.
 Global `pre-commit`:
 
 - repo-local `core.hooksPath` override를 거부한다.
+- 필요하면 recurring reminder를 출력한다. Reminder는 hook이 기계적으로 판정하기
+  어려운 반복 실수를 커밋 직전에 다시 확인하게 하는 주의 환기 문구다.
+  Reminder 출력 자체는 pass/fail gate가 아니다. Public skill에는 private
+  service, private network, maintainer-specific workflow 이름을 넣지 않고 generic
+  hook pattern만 둔다. Project별 문구는 local hook이나 repo-local
+  `.git/hooks/pre-commit.local`에서 좁힌다.
 - executable이면 `.git/hooks/pre-commit.local`을 chain한다.
+
+Recurring reminder 예시:
+
+- 수정 작업 후 커밋 전에 독립된 컨텍스트의 AI agent review를 받았는지
+  확인한다. 같은 대화 흐름의 self-review는 독립 리뷰로 보지 않는다.
+- 사용자 승인 없는 implicit fallback, default, auto-correction path를 추가하지
+  않았는지 확인한다.
+- 테스트가 production code와 실제 실패 모드를 검증하는지 확인한다.
+- 즉시 증상만 덮는 patchwork change가 아니라 원인, 경계, 검증 기준이 확인된
+  변경인지 확인한다.
 
 Global `prepare-commit-msg`:
 

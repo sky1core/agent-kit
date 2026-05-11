@@ -1,6 +1,6 @@
 ---
 name: operation-guard-hooks
-version: 1.0.0
+version: 1.0.4
 description: >
   위험한 agent 또는 Git 작업을 실행 전에 차단하거나 명시적 1회 승인을 요구하는
   operation guard hook을 설정, 점검, 검증할 때 사용한다. Claude Code
