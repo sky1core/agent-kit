@@ -45,6 +45,18 @@ Recurring reminder 예시:
 - 즉시 증상만 덮는 patchwork change가 아니라 원인, 경계, 검증 기준이 확인된
   변경인지 확인한다.
 
+Rule-file size gate 예시:
+
+- 프로젝트가 repository root `AGENTS.md`를 짧은 지속 규칙과 작업 경계 문서로
+  유지하기로 했다면, line limit을 hard gate로 둘 수 있다.
+- 예: `AGENTS.md`가 180줄을 초과하면 commit을 거부한다.
+- failure message는 `AGENTS.md`에 모든 구현 디테일, 진행 일지, 임시 판단
+  기록을 쌓지 말고, 기록이 필요하면 목적별 별도 문서나 ignored local note로
+  체계적으로 관리하라고 안내한다.
+- line limit은 project policy threshold다. public skill은 pattern을 설명하고,
+  실제 threshold와 적용 범위는 global hook 또는 repo-local
+  `.git/hooks/pre-commit.local`에서 해당 환경에 맞춰 정한다.
+
 Global `prepare-commit-msg`:
 
 - repo-local `core.hooksPath` override를 거부한다.
