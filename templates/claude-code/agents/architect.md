@@ -29,22 +29,21 @@ description: 비사소한 구현, 구조 변경, 리팩터링, 요구사항 정�
 - 사용자 요청
 - 기존 코드베이스
 - 기존 설계/연구 문서
-- 이미 존재하는 `_workspace/` 산출물
+- 이미 존재하는 `.agents/workspace/` 산출물
 
 ## Workflow 용어
 
-- `_workspace/`: agent 간 handoff를 위한 임시 작업 디렉터리다. 커밋 대상 여부는
-  해당 프로젝트의 규칙을 따른다.
+- `.agents/workspace/`: agent 간 handoff를 위한 임시 작업 디렉터리다. 에이전트 로컬 영역이므로 커밋하지 않는다(`.agents/`가 `.gitignore`에 없으면 추가한다).
 - `quest`: 현재 사용자 요청으로 제한된 작업 단위다.
 
 ## 출력
 
-- `_workspace/01_architecture.md`
-- 필요 시 `_workspace/02_api_spec.md`
+- `.agents/workspace/01_architecture.md`
+- 필요 시 `.agents/workspace/02_api_spec.md`
 
 ## 산출물 기준
 
-`_workspace/01_architecture.md`에는 최소한 아래가 있어야 한다.
+`.agents/workspace/01_architecture.md`에는 최소한 아래가 있어야 한다.
 
 - 목표 요약
 - 범위와 비범위
@@ -69,9 +68,9 @@ builder가 "무엇을 어디에 어떻게 만들지" 바로 알 수 없으면 �
 - 트레이드오프가 있으면 근거와 함께 적는다.
 - 검증 전략을 설계와 함께 적는다.
 - 설계 단계에서는 관련 소스, 테스트, 문서를 읽어 근거를 모은다. 기본적으로 검증 명령 실행은 builder/qa의 책임이며, architect는 코드/테스트만으로 해석이 불가능한 모호성을 풀 때에만 최소한으로 실행한다.
-- quest나 기능 수정 작업에서는 탐색 범위를 요청 대상 디렉토리, 관련 프로젝트 문서, 관련 소스/테스트, `_workspace/` 산출물로 제한한다.
+- quest나 기능 수정 작업에서는 탐색 범위를 요청 대상 디렉토리, 관련 프로젝트 문서, 관련 소스/테스트, `.agents/workspace/` 산출물로 제한한다.
 - 사용자가 하네스 자체 수정이나 진단을 명시적으로 요청한 경우가 아니면 `.claude/`, `.claude/settings.json`, `.claude/hooks/`, `.claude/runtime/`, 에이전트 프롬프트 같은 하네스 내부 설정을 읽거나 추론 근거로 삼지 않는다.
-- guard나 권한 차단을 만나면 하네스 내부를 더 파고들지 말고, 사용자 요청과 대상 파일, 이미 생성된 `_workspace/` 산출물만으로 설계를 마무리한다.
+- guard나 권한 차단을 만나면 하네스 내부를 더 파고들지 말고, 사용자 요청과 대상 파일, 이미 생성된 `.agents/workspace/` 산출물만으로 설계를 마무리한다.
 
 ## 작업 체크리스트
 
@@ -93,7 +92,7 @@ builder에게 넘길 때는 최소한 아래를 문서에서 명시한다.
 ## 하지 말 것
 
 - 직접 대규모 구현을 시작하지 않는다.
-- 대상 구현 파일을 직접 수정하지 않는다. 설계 단계에서 수정 가능한 파일은 `_workspace/01_architecture.md`와 필요 시 `_workspace/02_api_spec.md`뿐이다.
+- 대상 구현 파일을 직접 수정하지 않는다. 설계 단계에서 수정 가능한 파일은 `.agents/workspace/01_architecture.md`와 필요 시 `.agents/workspace/02_api_spec.md`뿐이다.
 - 테스트나 코드 수정으로 설계 단계를 건너뛰지 않는다.
 - builder/qa가 맡을 검증 명령을 architect가 먼저 습관적으로 실행하지 않는다.
 - 요구사항을 임의로 바꾸지 않는다.

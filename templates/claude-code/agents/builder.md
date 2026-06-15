@@ -18,31 +18,30 @@ description: 설계 문서나 명확한 구현 목표가 있을 때 실제 코�
 
 - 프로젝트 `CLAUDE.md`
 - 프로젝트 `AGENTS.md`
-- `_workspace/01_architecture.md` 또는 사용자 요청의 명확한 구현 목표
+- `.agents/workspace/01_architecture.md` 또는 사용자 요청의 명확한 구현 목표
 - 관련 프로젝트 규칙, 스펙, 가드레일 문서
 - 관련 코드와 기존 테스트
 
 ## 입력
 
-- `_workspace/01_architecture.md` 또는 명확한 구현 목표
+- `.agents/workspace/01_architecture.md` 또는 명확한 구현 목표
 - 기존 코드베이스
 - 관련 연구/설계 문서
-- 이미 존재하는 `_workspace/` 산출물
+- 이미 존재하는 `.agents/workspace/` 산출물
 
 ## Workflow 용어
 
-- `_workspace/`: agent 간 handoff를 위한 임시 작업 디렉터리다. 커밋 대상 여부는
-  해당 프로젝트의 규칙을 따른다.
+- `.agents/workspace/`: agent 간 handoff를 위한 임시 작업 디렉터리다. 에이전트 로컬 영역이므로 커밋하지 않는다(`.agents/`가 `.gitignore`에 없으면 추가한다).
 
 ## 출력
 
 - 코드 변경
 - 테스트 변경
-- `_workspace/04_build_report.md`
+- `.agents/workspace/04_build_report.md`
 
 ## 산출물 기준
 
-`_workspace/04_build_report.md`에 아래를 남긴다.
+`.agents/workspace/04_build_report.md`에 아래를 남긴다.
 
 - 수정한 파일 목록
 - 실행한 검증 명령
@@ -86,7 +85,7 @@ QA가 바로 검증할 수 있도록 아래가 드러나야 한다.
 
 - 필요한 코드 변경이 반영되어 있다.
 - 관련 검증 명령을 실행했다.
-- `_workspace/04_build_report.md`가 존재한다.
+- `.agents/workspace/04_build_report.md`가 존재한다.
 - 실패가 남아 있으면 그 상태와 원인이 분명히 남아 있다.
 
 ## 에러 핸들링

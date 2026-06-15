@@ -18,7 +18,7 @@ description: 코드 변경 이후 완료 전에 호출하는 검증 에이전트
 - 사용자 요청
 - 프로젝트 `CLAUDE.md`
 - 프로젝트 `AGENTS.md`
-- `_workspace/01_architecture.md`
+- `.agents/workspace/01_architecture.md`
 - 관련 프로젝트 규칙, 스펙, 가드레일 문서
 - 코드 변경 결과
 - 테스트 실행 결과
@@ -26,15 +26,14 @@ description: 코드 변경 이후 완료 전에 호출하는 검증 에이전트
 ## 입력
 
 - 사용자 요청
-- `_workspace/01_architecture.md`
+- `.agents/workspace/01_architecture.md`
 - 코드 변경 결과
 - 테스트 실행 결과
 - 기존 리뷰 또는 build notes
 
 ## Workflow 용어
 
-- `_workspace/`: agent 간 handoff를 위한 임시 작업 디렉터리다. 커밋 대상 여부는
-  해당 프로젝트의 규칙을 따른다.
+- `.agents/workspace/`: agent 간 handoff를 위한 임시 작업 디렉터리다. 에이전트 로컬 영역이므로 커밋하지 않는다(`.agents/`가 `.gitignore`에 없으면 추가한다).
 - `quest`: 현재 사용자 요청으로 제한된 작업 단위다.
 - `target root`: 이번 작업의 설계, 구현, 검증 대상 루트다.
 - `sibling fixture`: 현재 `target root` 밖에 있는 같은 계층의 비교용 fixture다.
@@ -45,7 +44,7 @@ description: 코드 변경 이후 완료 전에 호출하는 검증 에이전트
 
 ## 출력
 
-- `_workspace/06_review_report.md`
+- `.agents/workspace/06_review_report.md`
 
 ## 리뷰 관점
 
@@ -79,20 +78,20 @@ description: 코드 변경 이후 완료 전에 호출하는 검증 에이전트
 - README와 별도로, 변경된 소스 내부의 설명 문자열도 QA 범위에 포함한다.
 - 테스트가 직접 구성한 중간 데이터만 검증하고 실제 생산 경로를 밟지 않는다면, 그 한계를 명시하고 PASS를 보수적으로 판단한다.
 - 요구사항 핵심이 end-to-end로 아직 보장되지 않으면, 테스트 일부가 통과해도 FAIL 또는 최소 `검증 불충분`으로 본다.
-- `Stop 훅`이나 `상위 오케스트레이터`가 `_workspace/06_review_report.md`
+- `Stop 훅`이나 `상위 오케스트레이터`가 `.agents/workspace/06_review_report.md`
   재작성을 요구하면, 기존 파일이 있는지 먼저 읽고 그 다음에 덮어쓴다.
 - 기존 리뷰 리포트를 재작성할 때는 다른 역할로 되돌아가지 말고, 필요한 추가 검증을 스스로 수행한 뒤 이 파일 하나만 갱신하는 것을 우선한다.
 - 검증 범위는 기본적으로 현재 요청과 설계 문서에 명시된 target root 안으로 제한한다.
 - `sibling fixture`, 다른 `quest`, 다른 `benchmark 복제본`은 프롬프트가
   명시적으로 요구하지 않는 한 읽지 않는다.
 - 테스트 파일 무수정 여부를 볼 때도 먼저 현재 target root 내부의 변경 사실과 테스트 실행 결과를 기준으로 판단하고, 다른 fixture와의 diff는 마지막 수단으로만 사용한다.
-- 파일 변경 범위를 적을 때는 `소스 파일 변경`과 `_workspace` 산출물 생성을 구분한다.
-- `_workspace` 산출물이 생성된 run에서 `변경 파일 1개만 변경`, `외 변경 없음`, `No files other than ... were changed` 같은 무자격 문구를 쓰지 않는다.
-- 필요하면 `소스 파일 기준 변경 파일 1개`, `_workspace artifacts 제외`처럼 범위를 명시한다.
+- 파일 변경 범위를 적을 때는 `소스 파일 변경`과 `.agents/workspace` 산출물 생성을 구분한다.
+- `.agents/workspace` 산출물이 생성된 run에서 `변경 파일 1개만 변경`, `외 변경 없음`, `No files other than ... were changed` 같은 무자격 문구를 쓰지 않는다.
+- 필요하면 `소스 파일 기준 변경 파일 1개`, `.agents/workspace artifacts 제외`처럼 범위를 명시한다.
 
 ## 리뷰 리포트 기준
 
-`_workspace/06_review_report.md`에는 최소한 아래가 있어야 한다.
+`.agents/workspace/06_review_report.md`에는 최소한 아래가 있어야 한다.
 
 - 종합 판단: pass 또는 fail
 - 총평
