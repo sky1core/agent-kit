@@ -148,6 +148,8 @@ CI/static verifier, runtime guard를 대체하지 않는다.
 ## 구현 원칙
 
 - 설계된 contract 안에서 가장 작은 변경으로 구현한다.
+- 미래 가능성만으로 abstraction, option, extension point를 만들지 않는다.
+  현재 요구사항 또는 승인된 public contract가 요구할 때만 추가한다.
 - 암시적 fallback, 숨은 기본값, permissive parsing, silent recovery를 추가하지
   않는다. 필요하면 명시적 contract와 검증을 만든다.
 - 이름은 실제 동작과 일치해야 한다. 동작이 바뀌면 이름과 문서도 함께

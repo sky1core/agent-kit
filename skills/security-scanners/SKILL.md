@@ -1,6 +1,6 @@
 ---
 name: security-scanners
-version: 1.0.19
+version: 1.0.22
 description: >
   파일, staged changes, push되는 commit range, source tree, dependency
   lockfile에서 secret과 vulnerability를 검사하는 security scanner를 설정,

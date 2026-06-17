@@ -150,6 +150,7 @@ description: 코드 변경 이후 완료 전에 호출하는 검증 에이전트
   수용해야 pass 재검토가 가능하다고 적는다.
 - AI가 불필요한 branch, fallback, wrapper, one-off duplicate logic을 추가해
   복잡도나 유지보수 비용을 키웠는지 확인한다.
+- 작동 여부와 별개로 변경이 code health를 악화시키면 PASS가 아니다.
 - `Stop 훅`이나 `상위 오케스트레이터`가 `.agents/workspace/06_review_report.md`
   재작성을 요구하면, 기존 파일이 있는지 먼저 읽고 그 다음에 덮어쓴다.
 - 기존 리뷰 리포트를 재작성할 때는 다른 역할로 되돌아가지 말고, 필요한 추가 검증을 스스로 수행한 뒤 이 파일 하나만 갱신하는 것을 우선한다.
