@@ -7,6 +7,7 @@ agent guidance templates를 배포한다.
 
 ## 포함 스킬
 
+- `agents-local-overlay`
 - `doc-comment-principles`
 - `operation-guard-hooks`
 - `provision-agent-auth`
