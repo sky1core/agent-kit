@@ -8,15 +8,28 @@
 #                  directory, literally, with no import resolution (Kiro).
 #   local-native   file the CLI loads natively for local rules  ("-" if none)
 set -u
-[ $# -ge 4 ] || exit 0
+[ $# -ge 4 ] || {
+  printf '%s\n' 'agents-overlay-context: usage: agents-overlay-context <json|raw> <event> <shared-native> <local-native> [project-dir] [policy]' >&2
+  exit 1
+}
 format="$1"; event="$2"; shared_native="$3"; local_native="$4"
 project_dir="${5:-.}"; policy="${6:-default}"
 hook_cwd="$PWD"; hook_input=""
+command -v git >/dev/null 2>&1 || {
+  printf '%s\n' 'agents-overlay-context: git is required' >&2
+  exit 1
+}
 
 case "$policy" in
   claude-subagent|codex-session|codex-subagent)
-    [ "$format" = "json" ] || exit 0
-    command -v python3 >/dev/null 2>&1 || exit 0
+    [ "$format" = "json" ] || {
+      printf '%s\n' "agents-overlay-context: policy $policy requires the json format" >&2
+      exit 1
+    }
+    command -v python3 >/dev/null 2>&1 || {
+      printf '%s\n' 'agents-overlay-context: python3 is required' >&2
+      exit 1
+    }
     hook_input="$(cat)"
     ;;
 esac
@@ -52,8 +65,8 @@ if [ "${CLAUDE_CODE_DISABLE_CLAUDE_MDS:-}" = "1" ] &&
 fi
 
 cd -- "$project_dir" 2>/dev/null || {
-  [ "$policy" = "kiro-launcher" ] && exit 1
-  exit 0
+  printf '%s\n' "agents-overlay-context: cannot enter project directory: $project_dir" >&2
+  exit 1
 }
 start="$PWD"
 
@@ -100,9 +113,12 @@ trap - EXIT HUP INT TERM
 
 case "$policy:$shared_native" in
   codex-session:AGENTS.md|codex-subagent:AGENTS.md)
-    if { [ -e "$top/AGENTS.override.md" ] || [ -L "$top/AGENTS.override.md" ]; } &&
-       ! cmp -s "$top/AGENTS.override.md" "$top/AGENTS.md"; then
-      shared_native=-
+    # cmp only regular files: reading a fifo or device here can block forever.
+    if [ -e "$top/AGENTS.override.md" ] || [ -L "$top/AGENTS.override.md" ]; then
+      if [ ! -f "$top/AGENTS.override.md" ] || [ ! -f "$top/AGENTS.md" ] ||
+         ! cmp -s "$top/AGENTS.override.md" "$top/AGENTS.md"; then
+        shared_native=-
+      fi
     fi
     ;;
 esac
@@ -192,6 +208,7 @@ if [ "$policy" = "kiro-launcher" ]; then
 fi
 
 # HEAD:AGENTS.md must be a regular blob, not a symlink, tree, or gitlink.
+# 0 regular blob, 1 absent, 2 git error, 3 tracked but not a regular blob.
 head_agents_is_file() {
   head_commit="$(git -C "$top" rev-parse --verify -q HEAD 2>/dev/null)"
   head_status=$?
@@ -203,8 +220,15 @@ head_agents_is_file() {
   head_entry="$(git -C "$top" ls-tree "$head_commit" -- AGENTS.md 2>/dev/null)" || return 2
   case "$head_entry" in
     100644\ *|100755\ *) return 0 ;;
-    *) return 1 ;;
+    "") return 1 ;;
+    *) return 3 ;;
   esac
+}
+
+# A rule file the hook had to emit but refused (not a readable regular file)
+# must not vanish without a trace: inject this line in its place.
+refusal_notice() {   # <path description>
+  printf '[agents-local-overlay] Rule file not loaded: %s is not a readable regular file (symlinked rule files are never read as rules). Make it a readable regular file, then start a new session.' "$1"
 }
 
 root_agents_is_untracked() {
@@ -221,6 +245,7 @@ root_agents_is_untracked() {
 }
 
 shared=""
+shared_refused=""
 if [ "$shared_native" != "-" ] &&
    delivers "$(native_path "$shared_native")" "$top/AGENTS.md" "$root/AGENTS.md" \
             "$(native_marker "$shared_native" "@AGENTS.md")"; then
@@ -242,10 +267,18 @@ else
     elif [ "$root_result" -eq 2 ]; then
       exit 1
     fi
+  elif [ -e "$top/AGENTS.md" ] || [ -L "$top/AGENTS.md" ]; then
+    shared_refused="$top/AGENTS.md"
+  elif [ "$head_result" -eq 3 ]; then
+    shared_refused="$top/AGENTS.md (tracked in HEAD)"
+  elif [ "$root" != "$top" ] &&
+       { [ -e "$root/AGENTS.md" ] || [ -L "$root/AGENTS.md" ]; }; then
+    shared_refused="$root/AGENTS.md"
   fi
 fi
 
 local_rules=""
+local_refused=""
 if [ "$local_native" != "-" ] &&
    delivers "$(native_path "$local_native")" "$top/AGENTS.local.md" \
             "$root/AGENTS.local.md" \
@@ -253,21 +286,35 @@ if [ "$local_native" != "-" ] &&
   :                                                     # bridge present: CLI loads it natively
 elif readable "$root/AGENTS.local.md"; then
   local_rules="$(cat "$root/AGENTS.local.md")" || exit 1
+elif [ -e "$root/AGENTS.local.md" ] || [ -L "$root/AGENTS.local.md" ]; then
+  local_refused="$root/AGENTS.local.md"
 fi
 
-[ -n "$shared" ] || [ -n "$local_rules" ] || exit 0
+[ -n "$shared" ] || [ -n "$local_rules" ] ||
+  [ -n "$shared_refused" ] || [ -n "$local_refused" ] || exit 0
 
 # Pipe the body instead of passing it in the environment: rule files of any
 # size stay clear of the exec argument limit.
+emit_part() {   # <text>
+  if [ -n "$body_open" ]; then
+    printf '\n\n' || return 1
+  fi
+  printf '%s' "$1" || return 1
+  body_open=1
+}
 emit_body() {
+  body_open=""
   if [ -n "$shared" ]; then
-    printf '%s' "$shared" || return 1
-    if [ -n "$local_rules" ]; then
-      printf '\n\n' || return 1
-    fi
+    emit_part "$shared" || return 1
   fi
   if [ -n "$local_rules" ]; then
-    printf '%s' "$local_rules" || return 1
+    emit_part "$local_rules" || return 1
+  fi
+  if [ -n "$shared_refused" ]; then
+    emit_part "$(refusal_notice "$shared_refused")" || return 1
+  fi
+  if [ -n "$local_refused" ]; then
+    emit_part "$(refusal_notice "$local_refused")" || return 1
   fi
   printf '\n'
 }
@@ -276,7 +323,10 @@ if [ "$format" = "raw" ]; then
   emit_body
   exit $?
 fi
-command -v python3 >/dev/null 2>&1 || exit 0
+command -v python3 >/dev/null 2>&1 || {
+  printf '%s\n' 'agents-overlay-context: python3 is required for json output' >&2
+  exit 1
+}
 emit_body | AGENTS_EVENT="$event" AGENTS_POLICY="$policy" \
   AGENTS_HOOK_INPUT="$hook_input" python3 -c '
 import hashlib, json, os, stat, sys, tempfile

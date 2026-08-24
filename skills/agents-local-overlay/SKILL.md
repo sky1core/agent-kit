@@ -110,8 +110,8 @@ test ! -e AGENTS.override.md && test ! -L AGENTS.override.md && echo no-codex-ov
   commit하지 않는다.
 - repo root의 `AGENTS.override.md`는 두지 않는다. Codex가 `AGENTS.md` 대신 그
   파일을 선택하기 때문이다. runtime script도 override가 `AGENTS.md`와 byte 단위로
-  같지 않으면 공용 규칙을 주입해 누락을 막지만, override에 같은 규칙을 복사해
-  넣은 구성의 중복까지 판정할 수는 없다.
+  같지 않거나 둘 중 하나가 regular file이 아니면 공용 규칙을 주입해 누락을
+  막지만, override에 같은 규칙을 복사해 넣은 구성의 중복까지 판정할 수는 없다.
 - Codex의 `project_doc_max_bytes`는 아래처럼 최소 32768로 고정하고 `AGENTS.md`는
   그 이하여야 한다. 네이티브 로드가 잘린 뒤에는 hook이 이미 들어간 prefix와
   잘린 나머지를 분리해 exact-once로 복구할 수 없다. 더 큰 파일이 필요하면 이
@@ -144,7 +144,9 @@ sh -n "$HOME/.local/bin/agents-overlay-context" && \
 
 `awk`와 git 2.36 이상이 필요하고, JSON 형식과 runtime별 중복 판정을 쓰는
 Claude와 Codex 경로에는 `python3`도 필요하다. raw 형식만 쓰는 Kiro는
-`python3` 없이 동작한다.
+`python3` 없이 동작한다. 전제 도구(`git`, `python3`)가 없거나 인자·형식이
+잘못되면 script는 조용히 생략하지 않고 stderr 오류와 함께 실패해 각 CLI의
+hook 오류로 드러난다.
 
 스킬을 갱신했으면 위 `cp`를 다시 실행한다. 사본이 낡아도 문법은 유효해서
 `sh -n`으로는 드러나지 않으므로, 최신인지는 따로 본다.
@@ -164,7 +166,9 @@ CLI가 repo top의 그 파일에 네이티브로 닿는 경우다. Claude bridge
 판정하고, Codex는 규칙 파일 자체와 같은 경로인지 판정한다.
 `cwd:` prefix(`cwd:AGENTS.md`)는 CLI가 실행 디렉터리의 그 파일만 그대로 읽고
 import를 해석하지 않는 경우다(Kiro) — 이때는 그 파일이 규칙 파일 자체이거나
-그 파일로 가는 link일 때만 커버로 인정한다. `-`는 네이티브 경로가 아예 없다는
+그 파일로 가는 link일 때만 커버로 인정한다. 단 Kiro launcher는 이 판정 전에
+규칙 경로의 symlink를 먼저 거부하고 중단하므로, launcher 경로에서 link 커버는
+하드링크만 해당한다. `-`는 네이티브 경로가 아예 없다는
 뜻이고, 그 자리의 규칙은 항상 주입된다.
 
 스크립트가 판정하는 순서는 이렇다.
@@ -193,12 +197,14 @@ import를 해석하지 않는 경우다(Kiro) — 이때는 그 파일이 규칙
 **내용을 읽어 내보낼 때**는 symlink를 거부한다. repo가 규칙 파일을 개인
 파일로 향하게 만들어 컨텍스트로 빼돌리는 것을 막기 위해서다. commit된
 symlink도 같은 이유로 제외한다. 디스크의 `AGENTS.md`가 symlink라도 HEAD에
-regular file로 tracked면 그 HEAD 버전을 주입하고, HEAD까지 symlink이거나
-untracked면 hook은 침묵한다 — 이때 네이티브 경로가 없는 CLI에서는 그 규칙이
-로드되지 않는다. 신뢰할 수 없는 repo에서는 규칙 파일이 symlink인지 직접
-확인한다.
+regular file로 tracked면 그 HEAD 버전을 주입한다. HEAD까지 symlink이거나
+untracked면 규칙 내용 대신 `[agents-local-overlay] Rule file not loaded: ...`
+한 줄 안내를 주입해, 규칙이 무증상으로 빠지는 일이 없게 한다. 안내가 보이면
+그 파일을 읽을 수 있는 regular file로 되돌리고 새 세션을 시작한다. 안내는
+파일 내용을 읽지 않으므로 컨텍스트로 새는 것이 없다. 신뢰할 수 없는 repo에서는 규칙
+파일이 symlink인지 직접 확인한다.
 
-`python3`가 없으면 JSON 형식은 조용히 아무것도 출력하지 않는다.
+`python3`가 없으면 JSON 경로는 조용히 생략하지 않고 오류로 실패한다.
 
 git repo가 아니거나 주입할 내용이 없으면 아무것도 출력하지 않는다.
 
@@ -356,9 +362,12 @@ kiro-cli settings list --format json
 ```
 
 ```bash
-kiro-cli-overlay --help
+command -v kiro-cli-overlay
 kiro-cli diagnostic
 ```
+
+`kiro-cli-overlay`는 Git worktree 안에서만 실행되고 실행할 때마다 steering
+문서를 다시 만들므로, 설치 확인은 실행이 아니라 위처럼 `command -v`로 한다.
 
 - Kiro의 전역 `SessionStart` hook은 main에는 실행되지만 custom subagent에는
   실행되지 않는다. launcher는 Kiro process가 시작되기 전에 현재 checkout에서
@@ -395,6 +404,7 @@ secret처럼 보이면 모델이 답변을 거부할 수 있으므로 무해한 
 
 ```bash
 export OVERLAY_TMP_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/overlay-check.XXXXXX")"
+printf '%s\n' "$OVERLAY_TMP_ROOT"
 export OVERLAY_REPO="$OVERLAY_TMP_ROOT/repo"
 export OVERLAY_WT="$OVERLAY_TMP_ROOT/worktree"
 mkdir "$OVERLAY_REPO" && cd "$OVERLAY_REPO" && git init -q
@@ -460,6 +470,20 @@ kiro-cli-overlay
 
   여덟 형태 모두 0이 아니어야 한다. 0이면 판정이 bridge로 잘못 새서 공용
   규칙이 통째로 빠진다.
+- 거부 경로도 본다. 규칙 파일을 symlink로 바꾸면 내용 대신 로드 실패 안내가
+  나와야 한다.
+
+  ```bash
+  cd "$OVERLAY_REPO"
+  mv AGENTS.local.md AGENTS.local.md.real
+  ln -s AGENTS.local.md.real AGENTS.local.md
+  sh "$HOME/.local/bin/agents-overlay-context" raw SessionStart CLAUDE.md - .
+  unlink AGENTS.local.md && mv AGENTS.local.md.real AGENTS.local.md
+  ```
+
+  출력에 `Rule file not loaded`가 있고 `emerald-42`가 없어야 한다. 내용이
+  보이면 symlink 거부가 깨진 것이고, 아무것도 안 나오면 누락이 무증상으로
+  돌아간 것이다.
 - runtime 누락은 실제 agent에게 canary 값을 물어 확인하되, 모델이 답한 출현 수를
   중복 증거로 쓰지 않는다. 중복은 실제 입력 기록을 센다.
   - Claude는 `--debug-file`을 켜고 일반·`Explore`·`Plan`·fork를 실행한다. 각
@@ -468,7 +492,7 @@ kiro-cli-overlay
     하며, `Explore`·`Plan`은 합친 body가 한 번이어야 한다. canary 응답은 네 타입
     모두 값이 있는지만 본다.
   - Codex를 실행하기 직전에 해당 checkout에서
-    `sh "$OV" raw SessionStart AGENTS.md - . > "$OVERLAY_TMP_ROOT/codex-expected"`로
+    `sh "$HOME/.local/bin/agents-overlay-context" raw SessionStart AGENTS.md - . > "$OVERLAY_TMP_ROOT/codex-expected"`로
     expected body를 먼저 고정한다. 그 뒤 `fork_turns` 생략, `none`, 양의 정수를
     같은 turn에 생성하고, 각 agent JSONL에서 이 파일과 byte 단위로 같은 developer
     `input_text`를 세어 1인지 확인한다. live `transcript_path`를 넣어 script를 사후
@@ -505,14 +529,17 @@ kiro-cli-overlay
   없으므로 작은 rule 파일을 유지한다. 대체되면 뒤쪽 규칙은 모델이
   그 파일을 따로 열기 전까지 보이지 않으므로, hook이 주입하는 합계를 위 한계
   아래로 유지한다.
-- 판정 script 경로가 틀렸거나, JSON 형식인데 `python3`가 없으면 Claude·Codex
-  세션이 규칙 없이 조용히 시작된다. hook 실패가 실행 자체를 막지는 않는다.
+- 판정 script 경로가 틀리면 hook 명령 자체가 실패하고, script는 전제 도구가
+  없거나 인자·형식이 잘못되면 조용히 생략하지 않고 stderr 오류로 실패한다.
+  두 경우 모두 각 CLI의 hook 오류 표시나 debug 로그로 드러나지만, hook 실패가
+  세션 실행 자체를 막지는 않으므로 세팅 후 검증 절차를 반드시 거친다.
   Kiro launcher는 helper가 없거나 생성 경로가 안전하지 않으면 Kiro를 시작하지
-  않고 오류를 낸다. 세팅 후 검증 절차를 반드시 거친다.
+  않고 오류를 낸다.
 - hook은 네이티브 로드가 커버하는 자리에는 주입하지 않는다. bridge를
   symlink로 만든 repo에서도 중복 주입은 일어나지 않는다. 대신 규칙 파일의
   내용을 hook이 읽어야 하는 상황에서는 symlink를 거부한다 — HEAD에 regular
-  file로 tracked면 그 버전이 대신 주입되고, 아니면 그 규칙은 로드되지 않는다.
+  file로 tracked면 그 버전이 대신 주입되고, 아니면 규칙 대신 로드 실패 안내가
+  주입된다.
 - worktree에 `AGENTS.md`를 직접 만들면 그 파일이 우선한다. 팀 규칙을 가리게
   되므로 임시 파일을 남기지 않는다. 단 `CLAUDE.md`를 root의 규칙 파일로 가는
   link로 만들어 두면 Claude는 link 대상을 읽으므로 worktree의 `AGENTS.md`는
