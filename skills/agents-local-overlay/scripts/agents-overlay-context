@@ -1,0 +1,453 @@
+#!/bin/sh
+# Emit agent rule files that the current checkout cannot load natively.
+# Usage: agents-overlay-context <json|raw> <event-name> <shared-native> <local-native> [project-dir] [policy]
+#   shared-native  file the CLI loads natively for shared rules ("-" if none).
+#                  A bare name is one the CLI reaches at the repo top, with
+#                  import markers resolved (Claude, Codex). A "cwd:" prefix
+#                  means the CLI reads that file only from the launch
+#                  directory, literally, with no import resolution (Kiro).
+#   local-native   file the CLI loads natively for local rules  ("-" if none)
+set -u
+[ $# -ge 4 ] || exit 0
+format="$1"; event="$2"; shared_native="$3"; local_native="$4"
+project_dir="${5:-.}"; policy="${6:-default}"
+hook_cwd="$PWD"; hook_input=""
+
+case "$policy" in
+  claude-subagent|codex-session|codex-subagent)
+    [ "$format" = "json" ] || exit 0
+    command -v python3 >/dev/null 2>&1 || exit 0
+    hook_input="$(cat)"
+    ;;
+esac
+
+if [ "$policy" = "claude-subagent" ]; then
+  agent_type="$(AGENTS_HOOK_INPUT="$hook_input" python3 -c '
+import json, os
+try:
+    hook = json.loads(os.environ["AGENTS_HOOK_INPUT"])
+    agent_type = hook.get("agent_type") if isinstance(hook, dict) else None
+    print(agent_type if isinstance(agent_type, str) and agent_type else "__invalid__")
+except Exception:
+    print("__invalid__")
+')"
+  case "$agent_type" in
+    fork)
+      exit 0
+      ;;
+    Explore|Plan)
+      shared_native=-; local_native=-; project_dir="$hook_cwd"
+      ;;
+    __invalid__)
+      shared_native=-; local_native=-; project_dir="$hook_cwd"
+      ;;
+  esac
+fi
+
+if [ "${CLAUDE_CODE_DISABLE_CLAUDE_MDS:-}" = "1" ] &&
+   [ "$shared_native" = "CLAUDE.md" ] &&
+   [ "$local_native" = "CLAUDE.local.md" ]; then
+  shared_native=-
+  local_native=-
+fi
+
+cd -- "$project_dir" 2>/dev/null || {
+  [ "$policy" = "kiro-launcher" ] && exit 1
+  exit 0
+}
+start="$PWD"
+
+top_output="$(
+  git rev-parse --path-format=absolute --show-toplevel 2>/dev/null || exit 1
+  printf .
+)" || {
+  [ "$policy" = "kiro-launcher" ] && exit 1
+  exit 0
+}
+top_output=${top_output%.}
+newline='
+'
+case "$top_output" in
+  *"$newline") top=${top_output%"$newline"} ;;
+  *) exit 1 ;;
+esac
+common_output="$(
+  git -C "$top" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || exit 1
+  printf .
+)" || exit 1
+common_output=${common_output%.}
+case "$common_output" in
+  *"$newline") common=${common_output%"$newline"} ;;
+  *) exit 1 ;;
+esac
+worktree_file="$(mktemp "${TMPDIR:-/tmp}/agents-overlay-worktrees.XXXXXX")" || exit 1
+trap 'unlink "$worktree_file" 2>/dev/null || :' EXIT HUP INT TERM
+git -C "$top" worktree list --porcelain -z > "$worktree_file" 2>/dev/null || exit 1
+root_output="$(LC_ALL=C awk '
+  BEGIN { RS = "\0"; found = 0 }
+  NR == 1 && /^worktree \/.*$/ {
+    sub(/^worktree /, "")
+    printf "%s.", $0
+    found = 1
+    exit
+  }
+  END { if (!found) exit 1 }
+' "$worktree_file")" || exit 1
+root=${root_output%.}
+unlink "$worktree_file" || exit 1
+trap - EXIT HUP INT TERM
+[ -n "$root" ] && [ -d "$root" ] || exit 1
+
+case "$policy:$shared_native" in
+  codex-session:AGENTS.md|codex-subagent:AGENTS.md)
+    if { [ -e "$top/AGENTS.override.md" ] || [ -L "$top/AGENTS.override.md" ]; } &&
+       ! cmp -s "$top/AGENTS.override.md" "$top/AGENTS.md"; then
+      shared_native=-
+    fi
+    ;;
+esac
+
+# A native file counts as delivering the rules only when the import marker
+# stands alone on its own line, clear of the blocks that swallow what follows
+# them: fenced code, indented code, HTML, link reference definitions, and
+# frontmatter. Every position this is unsure about it rejects, so the hook
+# injects there instead of guessing. Matching more widely means emulating
+# markdown block structure, and being wrong that way drops the rules with no
+# symptom.
+imports() {   # <file> <import marker>
+  LC_ALL=C awk -v m="$2" '
+    BEGIN { alt = "@./" substr(m, 2) }
+    NR == 1 { sub(/^\357\273\277/, "") }              # UTF-8 BOM
+    { sub(/\r$/, ""); line = $0 }
+    { ind = 0; while (substr(line, ind + 1, 1) == " ") ind++ }
+    { body = substr(line, ind + 1) }
+    { dashes = (ind == 0 && body ~ /^---/ && body ~ /^-+[ \t]*$/) }
+    NR == 1 && dashes { fm = 1; next }                 # YAML frontmatter
+    fm { if (dashes) fm = 0; next }
+    ind <= 3 && body ~ /^(```+|~~~+)/ {
+      ch = substr(body, 1, 1); n = 0
+      while (substr(body, n + 1, 1) == ch) n++
+      info = substr(body, n + 1)
+      if (ch != "`" || index(info, "`") == 0) {        # a ` in the info string
+        if (!fence) { fence = 1; fch = ch; flen = n }  # means this opens nothing
+        else if (ch == fch && n >= flen && info ~ /^ *$/) fence = 0
+        next
+      }
+    }
+    fence { next }
+    body ~ /^</ || body ~ /^\[[^]]*\]:/ { unsafe = 1 } # HTML block, link ref def
+    unsafe { next }
+    ind > 3 { next }                                   # indented code block
+    { sub(/[ \t]+$/, "", body) }
+    body == m || body == alt { found = 1; exit }
+    END { exit !found }
+  ' "$1" 2>/dev/null
+}
+
+# Does the CLI's native file actually deliver the rules here? Only then can the
+# hook stay silent without losing them. A link counts against both places the
+# rule file can live, because a worktree shares the copy at the repo root. The
+# import marker resolves next to the native file, so that path must exist. A
+# "-" marker means the CLI reads its native file literally: only identity with
+# the rule file counts, never an import line inside some other file.
+delivers() {   # <native file> <rule file here> <rule file at root> <import marker or "-">
+  [ -f "$1" ] || return 1                             # missing, dangling, directory, fifo or
+                                                      # device: delivers nothing, and reading
+                                                      # one can block. Comes first so a link
+                                                      # to one of those is never taken as cover
+  { [ -e "$2" ] && [ "$1" -ef "$2" ]; } && return 0   # the rule file itself, or a link
+  { [ -e "$3" ] && [ "$1" -ef "$3" ]; } && return 0   # a link to the repo-wide copy
+  [ "$4" = "-" ] && return 1                          # literal reader: nothing else delivers
+  [ -L "$1" ] && return 1                             # a symlink pointing somewhere else
+  [ -e "$2" ] || return 1                             # the marker would resolve to nothing
+  imports "$1" "$4"                                   # a regular file must import it
+}
+# Where the CLI looks its native file up, and whether it resolves imports there.
+native_path() {   # <native arg>
+  case "$1" in cwd:*) printf '%s/%s' "$start" "${1#cwd:}" ;;
+               *) printf '%s/%s' "$top" "$1" ;; esac
+}
+native_marker() { # <native arg> <import marker>
+  case "$1" in cwd:*) printf '%s' - ;; *) printf '%s' "$2" ;; esac
+}
+# Emitting a file's content is different: refuse symlinks so a repo cannot
+# point a rule file at something private.
+readable() { [ -f "$1" ] && [ -r "$1" ] && [ ! -L "$1" ]; }
+
+if [ "$policy" = "kiro-launcher" ]; then
+  for rule_path in "$top/AGENTS.md" "$root/AGENTS.local.md"; do
+    if [ -e "$rule_path" ] || [ -L "$rule_path" ]; then
+      if ! readable "$rule_path" || ! cat "$rule_path" >/dev/null 2>&1; then
+        printf '%s\n' "agents-overlay-context: unreadable rule file: $rule_path" >&2
+        exit 1
+      fi
+    fi
+  done
+  if [ "$root" != "$top" ] && { [ -e "$root/AGENTS.md" ] || [ -L "$root/AGENTS.md" ]; }; then
+    if ! readable "$root/AGENTS.md" || ! cat "$root/AGENTS.md" >/dev/null 2>&1; then
+      printf '%s\n' "agents-overlay-context: unreadable rule file: $root/AGENTS.md" >&2
+      exit 1
+    fi
+  fi
+fi
+
+# HEAD:AGENTS.md must be a regular blob, not a symlink, tree, or gitlink.
+head_agents_is_file() {
+  head_commit="$(git -C "$top" rev-parse --verify -q HEAD 2>/dev/null)"
+  head_status=$?
+  case "$head_status" in
+    0) ;;
+    1) return 1 ;;
+    *) return 2 ;;
+  esac
+  head_entry="$(git -C "$top" ls-tree "$head_commit" -- AGENTS.md 2>/dev/null)" || return 2
+  case "$head_entry" in
+    100644\ *|100755\ *) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+root_agents_is_untracked() {
+  if [ "$root" = "$common" ] || [ "$root" -ef "$common" ]; then
+    return 0
+  fi
+  git -C "$root" ls-files --error-unmatch AGENTS.md >/dev/null 2>&1
+  tracked_status=$?
+  case "$tracked_status" in
+    0) return 1 ;;
+    1) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+shared=""
+if [ "$shared_native" != "-" ] &&
+   delivers "$(native_path "$shared_native")" "$top/AGENTS.md" "$root/AGENTS.md" \
+            "$(native_marker "$shared_native" "@AGENTS.md")"; then
+  :                                                     # CLI loads it natively
+elif readable "$top/AGENTS.md"; then
+  shared="$(cat "$top/AGENTS.md")" || exit 1            # present but CLI cannot read it
+else
+  head_result=0
+  head_agents_is_file || head_result=$?
+  if [ "$head_result" -eq 0 ]; then
+    shared="$(git -C "$top" show "$head_commit:AGENTS.md" 2>/dev/null)" || exit 1
+  elif [ "$head_result" -eq 2 ]; then
+    exit 1
+  elif [ "$root" != "$top" ] && readable "$root/AGENTS.md"; then
+    root_result=0
+    root_agents_is_untracked || root_result=$?
+    if [ "$root_result" -eq 0 ]; then
+      shared="$(cat "$root/AGENTS.md")" || exit 1       # untracked at root: shared by policy
+    elif [ "$root_result" -eq 2 ]; then
+      exit 1
+    fi
+  fi
+fi
+
+local_rules=""
+if [ "$local_native" != "-" ] &&
+   delivers "$(native_path "$local_native")" "$top/AGENTS.local.md" \
+            "$root/AGENTS.local.md" \
+            "$(native_marker "$local_native" "@AGENTS.local.md")"; then
+  :                                                     # bridge present: CLI loads it natively
+elif readable "$root/AGENTS.local.md"; then
+  local_rules="$(cat "$root/AGENTS.local.md")" || exit 1
+fi
+
+[ -n "$shared" ] || [ -n "$local_rules" ] || exit 0
+
+# Pipe the body instead of passing it in the environment: rule files of any
+# size stay clear of the exec argument limit.
+emit_body() {
+  if [ -n "$shared" ]; then
+    printf '%s' "$shared" || return 1
+    if [ -n "$local_rules" ]; then
+      printf '\n\n' || return 1
+    fi
+  fi
+  if [ -n "$local_rules" ]; then
+    printf '%s' "$local_rules" || return 1
+  fi
+  printf '\n'
+}
+
+if [ "$format" = "raw" ]; then
+  emit_body
+  exit $?
+fi
+command -v python3 >/dev/null 2>&1 || exit 0
+emit_body | AGENTS_EVENT="$event" AGENTS_POLICY="$policy" \
+  AGENTS_HOOK_INPUT="$hook_input" python3 -c '
+import hashlib, json, os, stat, sys, tempfile
+
+body = sys.stdin.read()
+policy = os.environ["AGENTS_POLICY"]
+def emit_json():
+    sys.stdout.write(json.dumps({"hookSpecificOutput": {
+        "hookEventName": os.environ["AGENTS_EVENT"],
+        "additionalContext": body}}) + "\n")
+    sys.stdout.flush()
+
+if policy in ("codex-session", "codex-subagent"):
+    def message_body_state(item):
+        if not isinstance(item, dict):
+            return False, False
+        if item.get("type") == "response_item":
+            item = item.get("payload")
+        if not isinstance(item, dict):
+            return False, False
+        if item.get("type") != "message":
+            return True, False
+        role = item.get("role")
+        if not isinstance(role, str):
+            return False, False
+        contents = item.get("content")
+        if not isinstance(contents, list):
+            return False, False
+        present = False
+        for content in contents:
+            if not isinstance(content, dict):
+                return False, False
+            content_type = content.get("type")
+            if not isinstance(content_type, str):
+                return False, False
+            if content_type != "input_text":
+                continue
+            text = content.get("text")
+            if not isinstance(text, str):
+                return False, False
+            if role == "developer" and text.rstrip("\n") == body.rstrip("\n"):
+                present = True
+        return True, present
+
+    def emit_generation(hook, generation, reset):
+        identity_key = "agent_id" if policy == "codex-subagent" else "session_id"
+        identity = hook.get(identity_key)
+        if not isinstance(identity, str) or not identity or not generation:
+            return False
+        emitted = False
+        try:
+            import fcntl
+
+            root = os.path.join(
+                tempfile.gettempdir(), f"agents-overlay-context-{os.getuid()}"
+            )
+            try:
+                os.mkdir(root, 0o700)
+            except FileExistsError:
+                pass
+            root_stat = os.lstat(root)
+            if (
+                not stat.S_ISDIR(root_stat.st_mode)
+                or root_stat.st_uid != os.getuid()
+                or root_stat.st_mode & 0o077
+            ):
+                return False
+            name = hashlib.sha256(
+                (policy + "\0" + identity + "\0" + body).encode("utf-8")
+            ).hexdigest()
+            flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(os.path.join(root, name), flags, 0o600)
+            with os.fdopen(fd, "r+", encoding="utf-8") as state_file:
+                state_stat = os.fstat(state_file.fileno())
+                if (
+                    not stat.S_ISREG(state_stat.st_mode)
+                    or state_stat.st_uid != os.getuid()
+                    or state_stat.st_mode & 0o077
+                ):
+                    return False
+                fcntl.flock(state_file.fileno(), fcntl.LOCK_EX)
+                current = "" if reset else state_file.read().strip()
+                if current == generation:
+                    return True
+                emit_json()
+                emitted = True
+                state_file.seek(0)
+                state_file.truncate()
+                state_file.write(generation + "\n")
+                state_file.flush()
+        except (ImportError, OSError, UnicodeError):
+            return emitted
+        return True
+
+    try:
+        hook = json.loads(os.environ["AGENTS_HOOK_INPUT"])
+        if not isinstance(hook, dict):
+            raise TypeError
+        hook_source = hook.get("source") if policy == "codex-session" else None
+        inspect_transcript = (
+            policy == "codex-subagent" or hook_source in ("resume", "compact")
+        )
+        present = False
+        reliable = policy != "codex-session" or hook_source in (
+            "startup", "resume", "clear", "compact"
+        )
+        latest_window = None
+        transcript_path = hook.get("transcript_path")
+        if not isinstance(transcript_path, str) or not transcript_path:
+            reliable = False
+        else:
+            with open(transcript_path, encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        item = json.loads(line)
+                        if not isinstance(item, dict):
+                            reliable = False
+                            break
+                        if item.get("type") == "compacted":
+                            payload = item.get("payload")
+                            if not isinstance(payload, dict):
+                                reliable = False
+                                break
+                            history = payload.get("replacement_history")
+                            if not isinstance(history, list) or any(
+                                not isinstance(entry, dict) for entry in history
+                            ):
+                                reliable = False
+                                break
+                            window = payload.get("window_id")
+                            if not isinstance(window, str) or not window:
+                                reliable = False
+                                break
+                            try:
+                                window.encode("utf-8")
+                            except UnicodeEncodeError:
+                                reliable = False
+                                break
+                            latest_window = window
+                            present = False
+                            for entry in history:
+                                valid, entry_present = message_body_state(entry)
+                                if not valid:
+                                    reliable = False
+                                    break
+                                present = present or entry_present
+                            if not reliable:
+                                break
+                        else:
+                            valid, item_present = message_body_state(item)
+                            if not valid:
+                                reliable = False
+                                break
+                            present = present or item_present
+                    except (json.JSONDecodeError, AttributeError, TypeError):
+                        reliable = False
+                        break
+        if inspect_transcript and reliable and present:
+            raise SystemExit(0)
+        if reliable:
+            source = hook_source if policy == "codex-session" else "subagent"
+            reset = source in ("startup", "resume", "clear")
+            turn_id = hook.get("turn_id")
+            generation = latest_window or (
+                f"{source}:{turn_id}" if source and isinstance(turn_id, str) and turn_id else None
+            )
+            if policy == "codex-session" and source == "compact" and latest_window is None:
+                generation = None
+            if emit_generation(hook, generation, reset):
+                raise SystemExit(0)
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, AttributeError, TypeError):
+        pass
+
+emit_json()'
