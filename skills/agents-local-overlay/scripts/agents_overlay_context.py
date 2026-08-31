@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -30,6 +31,11 @@ CODEX_PROJECT_DOC_MAX_BYTES = 32768
 CODEX_PROJECT_DOC_MAX_BYTES_ENV = "AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES"
 DEFAULT_SCAN_MAX_ENTRIES = 200000
 SCAN_MAX_ENTRIES_ENV = "AGENTS_OVERLAY_SCAN_MAX_ENTRIES"
+KIRO_INHERITANCE_SETTING = "chat.disableInheritingDefaultResources"
+KIRO_VERIFY_REFUSAL = f"could not verify Kiro {KIRO_INHERITANCE_SETTING} setting"
+KIRO_FALSE_REMEDIATION = f"run: kiro-cli settings {KIRO_INHERITANCE_SETTING} false"
+CLAUDE_MD_EXCLUDES_KEY = "claudeMdExcludes"
+CLAUDE_MD_EXCLUDES_REFUSAL = f"could not verify Claude settings {CLAUDE_MD_EXCLUDES_KEY}"
 CLAUDE_POLICIES = ("default", "claude-session", "claude-subagent")
 CLAUDE_HOOK_POLICIES = ("claude-session", "claude-subagent")
 CLAUDE_WORKTREE_DIR_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR"
@@ -485,6 +491,13 @@ def codex_home() -> Path:
     return Path.home() / ".codex"
 
 
+def claude_config_dir() -> Path:
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    if configured:
+        return Path(configured)
+    return Path.home() / ".claude"
+
+
 @dataclass(frozen=True)
 class CodexConfig:
     state: str
@@ -772,6 +785,122 @@ def nested_rule_problems(ctx: RepoContext) -> Tuple[List[str], List[str]]:
     return problems, warnings
 
 
+def kiro_inheritance_refusal(cwd: Optional[Path] = None) -> str:
+    binary = shutil.which("kiro-cli")
+    if not binary:
+        return "kiro-cli was not found"
+    try:
+        proc = subprocess.run(
+            [binary, "settings", "list", "--format", "json"],
+            cwd=str(cwd) if cwd is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return KIRO_VERIFY_REFUSAL
+    if proc.returncode != 0:
+        return KIRO_VERIFY_REFUSAL
+    try:
+        settings = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return KIRO_VERIFY_REFUSAL
+    if not isinstance(settings, dict):
+        return KIRO_VERIFY_REFUSAL
+    if KIRO_INHERITANCE_SETTING not in settings:
+        return f"Kiro {KIRO_INHERITANCE_SETTING} is absent; {KIRO_FALSE_REMEDIATION}"
+    value = settings[KIRO_INHERITANCE_SETTING]
+    if value is True:
+        return (
+            f"Kiro {KIRO_INHERITANCE_SETTING} is true; custom agents would not "
+            "inherit AGENTS.md"
+        )
+    if value is not False:
+        return (
+            f"Kiro {KIRO_INHERITANCE_SETTING} must be boolean false; "
+            f"{KIRO_FALSE_REMEDIATION}"
+        )
+    return ""
+
+
+def kiro_inheritance_warnings(ctx: RepoContext) -> List[str]:
+    if shutil.which("kiro-cli") is None:
+        return []
+    refusal = kiro_inheritance_refusal(ctx.top)
+    if refusal:
+        return [f"kiro-launcher: {refusal}"]
+    return []
+
+
+def claude_settings_paths(ctx: RepoContext) -> Tuple[Path, ...]:
+    return (
+        claude_config_dir() / "settings.json",
+        ctx.top / ".claude" / "settings.json",
+        ctx.top / ".claude" / "settings.local.json",
+    )
+
+
+def bridge_rel_candidates(ctx: RepoContext, name: str, path: Path) -> Tuple[str, ...]:
+    candidates = [name]
+    try:
+        candidates.append(str(path.relative_to(ctx.top)))
+    except ValueError:
+        pass
+    return tuple(dict.fromkeys(candidates))
+
+
+def fnmatch_bridge(pattern: str, candidates: Tuple[str, ...]) -> bool:
+    if pattern in candidates:
+        return True
+    if any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates):
+        return True
+    if pattern.startswith("**/"):
+        stripped = pattern[3:]
+        return stripped in candidates or any(
+            fnmatch.fnmatch(candidate, stripped) for candidate in candidates
+        )
+    return False
+
+
+def claude_excluded_bridge_name(ctx: RepoContext, patterns: Sequence[str]) -> str:
+    bridges = (
+        (CLAUDE_SHARED_BRIDGE, ctx.top / CLAUDE_SHARED_BRIDGE),
+        (CLAUDE_LOCAL_BRIDGE, ctx.root / CLAUDE_LOCAL_BRIDGE),
+    )
+    for pattern in patterns:
+        for name, path in bridges:
+            if fnmatch_bridge(pattern, bridge_rel_candidates(ctx, name, path)):
+                return name
+    return ""
+
+
+def claude_bridge_exclusion_refusal(ctx: RepoContext) -> str:
+    for path in claude_settings_paths(ctx):
+        if not path_exists(path):
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return CLAUDE_MD_EXCLUDES_REFUSAL
+        if not isinstance(data, dict):
+            return CLAUDE_MD_EXCLUDES_REFUSAL
+        if CLAUDE_MD_EXCLUDES_KEY not in data:
+            continue
+        patterns = data[CLAUDE_MD_EXCLUDES_KEY]
+        if not isinstance(patterns, list) or not all(
+            isinstance(pattern, str) for pattern in patterns
+        ):
+            return CLAUDE_MD_EXCLUDES_REFUSAL
+        excluded = claude_excluded_bridge_name(ctx, patterns)
+        if excluded:
+            return (
+                f"Claude {CLAUDE_MD_EXCLUDES_KEY} excludes {excluded}; "
+                "remove that exclusion or set CLAUDE_CODE_DISABLE_CLAUDE_MDS=1"
+            )
+    return ""
+
+
 def codex_override_refusal(ctx: RepoContext, policy: str) -> str:
     if policy not in ("codex-session", "codex-subagent"):
         return ""
@@ -819,6 +948,9 @@ def build_body(
             return rules_withheld_notice("; ".join(nesting_refusals)) + "\n"
         if policy == "kiro-launcher":
             strict_kiro_sources(ctx)
+            kiro_refusal = kiro_inheritance_refusal(ctx.top)
+            if kiro_refusal:
+                raise OverlayError(kiro_refusal)
             findings, incomplete = scan_worktree_rule_files(ctx.top)
             if findings:
                 raise OverlayError(nested_rule_finding_problem(ctx.top, findings))
@@ -830,6 +962,16 @@ def build_body(
         override_refusal = codex_override_refusal(ctx, policy)
         if override_refusal:
             return rule_error_notice(override_refusal) + "\n"
+        if (
+            policy in CLAUDE_HOOK_POLICIES
+            and (
+                shared_native == CLAUDE_SHARED_BRIDGE
+                or local_native == CLAUDE_LOCAL_BRIDGE
+            )
+        ):
+            claude_refusal = claude_bridge_exclusion_refusal(ctx)
+            if claude_refusal:
+                return rules_withheld_notice(claude_refusal) + "\n"
         if policy in ("codex-session", "codex-subagent"):
             codex_refusals = codex_runtime_precondition_refusals(ctx)
             if codex_refusals:
@@ -1774,12 +1916,16 @@ def verify_context(ctx: RepoContext) -> Tuple[List[str], List[str]]:
 
     problems.extend(rule_resolution_problems(ctx))
     problems.extend(codex_native_size_problems(ctx))
+    claude_refusal = claude_bridge_exclusion_refusal(ctx)
+    if claude_refusal:
+        problems.append(claude_refusal)
     codex_problems, codex_warnings = codex_precondition_findings(ctx)
     problems.extend(codex_problems)
     warnings.extend(codex_warnings)
     scan_problems, scan_warnings = nested_rule_problems(ctx)
     problems.extend(scan_problems)
     warnings.extend(scan_warnings)
+    warnings.extend(kiro_inheritance_warnings(ctx))
     warnings.extend(cli_version_warnings())
     cap_problems, cap_warnings = overlay_cap_findings(ctx)
     problems.extend(cap_problems)
@@ -1829,12 +1975,16 @@ def setup_context(ctx: RepoContext) -> int:
         problems.append(f"{ctx.top / 'AGENTS.override.md'} must not exist for this overlay")
     problems.extend(rule_resolution_problems(ctx))
     problems.extend(codex_native_size_problems(ctx))
+    claude_refusal = claude_bridge_exclusion_refusal(ctx)
+    if claude_refusal:
+        problems.append(claude_refusal)
     codex_problems, codex_warnings = codex_precondition_findings(ctx)
     problems.extend(codex_problems)
     setup_warnings.extend(codex_warnings)
     scan_problems, scan_warnings = nested_rule_problems(ctx)
     problems.extend(scan_problems)
     setup_warnings.extend(scan_warnings)
+    setup_warnings.extend(kiro_inheritance_warnings(ctx))
     cap_problems, cap_warnings = overlay_cap_findings(ctx, include_claude_session=False)
     problems.extend(cap_problems)
     setup_warnings.extend(cap_warnings)

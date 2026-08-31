@@ -25,7 +25,14 @@ EMPTY_CODEX_HOME = Path(MODULE_TMP.name) / "codex-home"
 IN_WINDOW_CLI_SCRIPTS = {
     "claude": "echo 2.1.235",
     "codex": "echo codex-cli 0.147.0",
-    "kiro-cli": "echo 2.15.1",
+    "kiro-cli": (
+        'if [ "$1" = "settings" ] && [ "$2" = "list" ] && '
+        '[ "$3" = "--format" ] && [ "$4" = "json" ]; then\n'
+        '  printf \'%s\\n\' \'{"chat.disableInheritingDefaultResources": false}\'\n'
+        "  exit 0\n"
+        "fi\n"
+        "echo 2.15.1"
+    ),
 }
 
 
@@ -43,18 +50,22 @@ EMPTY_CODEX_HOME.mkdir(parents=True, exist_ok=True)
 
 
 def isolated_env(env=None):
+    incoming = env or {}
     run_env = os.environ.copy()
     for key in list(run_env):
         if key.startswith("GIT_CONFIG") or key.startswith("AGENTS_OVERLAY_"):
             run_env.pop(key)
     run_env.pop("CLAUDE_CODE_DISABLE_CLAUDE_MDS", None)
+    if "CLAUDE_CONFIG_DIR" not in incoming:
+        run_env["CLAUDE_CONFIG_DIR"] = tempfile.mkdtemp(
+            dir=MODULE_TMP.name, prefix="claude-config-"
+        )
     run_env["GIT_CONFIG_NOSYSTEM"] = "1"
     run_env["GIT_CONFIG_SYSTEM"] = os.devnull
     run_env["GIT_CONFIG_GLOBAL"] = os.devnull
     run_env["CODEX_HOME"] = str(EMPTY_CODEX_HOME)
     run_env["PATH"] = str(FAKE_CLI_BIN) + os.pathsep + run_env.get("PATH", "")
-    if env:
-        run_env.update(env)
+    run_env.update(incoming)
     return run_env
 
 
@@ -143,7 +154,23 @@ class OverlayContextTest(unittest.TestCase):
         )
         return {"PATH": str(bin_dir) + os.pathsep + "/usr/bin:/bin"}
 
-    def kiro_wrapper_env(self, settings_json="{}"):
+    def kiro_settings_cli_env(self, settings_json):
+        return self.cli_bin_env(
+            {
+                "kiro-cli": (
+                    'if [ "$1" = "settings" ] && [ "$2" = "list" ] && '
+                    '[ "$3" = "--format" ] && [ "$4" = "json" ]; then\n'
+                    f"  printf '%s\\n' '{settings_json}'\n"
+                    "  exit 0\n"
+                    "fi\n"
+                    "echo 2.15.1"
+                )
+            }
+        )
+
+    def kiro_wrapper_env(
+        self, settings_json='{"chat.disableInheritingDefaultResources": false}'
+    ):
         fake_bin = Path(tempfile.mkdtemp(dir=self.root, prefix="kiro-bin-"))
         marker = self.root / f"kiro-exec-{len(list(self.root.glob('kiro-exec-*')))}"
         fake_kiro = fake_bin / "kiro-cli"
@@ -1291,7 +1318,7 @@ class OverlayContextTest(unittest.TestCase):
         (repo / "AGENTS.md").write_text("codename bluebird\n", encoding="utf-8")
         self.commit(repo, "AGENTS.md", ".gitignore")
         (repo / "AGENTS.local.md").write_text("marker emerald-42\n", encoding="utf-8")
-        env, marker = self.kiro_wrapper_env("{}")
+        env, marker = self.kiro_wrapper_env()
 
         proc = run([sys.executable, KIRO, "--probe"], repo, env=env)
 
@@ -1315,7 +1342,7 @@ class OverlayContextTest(unittest.TestCase):
         sub = repo / "sub"
         sub.mkdir()
         (sub / "AGENTS.md").write_text("nested\n", encoding="utf-8")
-        env, marker = self.kiro_wrapper_env("{}")
+        env, marker = self.kiro_wrapper_env()
 
         proc = run([sys.executable, KIRO, "--probe"], repo, env=env, check=False)
 
@@ -1337,6 +1364,19 @@ class OverlayContextTest(unittest.TestCase):
         self.assertIn("chat.disableInheritingDefaultResources is true", err)
         self.assertIn("custom agents would not inherit AGENTS.md", err)
 
+    def test_kiro_launcher_wrapper_aborts_when_inheritance_key_absent(self):
+        repo = self.clean_repo()
+        env, marker = self.kiro_wrapper_env("{}")
+
+        proc = run([sys.executable, KIRO, "--probe"], repo, env=env, check=False)
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertFalse(marker.exists())
+        self.assertFalse((repo / ".kiro/steering/agents-local-overlay.md").exists())
+        err = proc.stderr.decode()
+        self.assertIn("chat.disableInheritingDefaultResources is absent", err)
+        self.assertIn("kiro-cli settings chat.disableInheritingDefaultResources false", err)
+
     def test_kiro_launcher_wrapper_aborts_on_non_bool_inheritance_value(self):
         repo = self.clean_repo()
         env, marker = self.kiro_wrapper_env('{"chat.disableInheritingDefaultResources": "true"}')
@@ -1347,7 +1387,7 @@ class OverlayContextTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse((repo / ".kiro/steering/agents-local-overlay.md").exists())
         self.assertIn(
-            "could not verify Kiro chat.disableInheritingDefaultResources setting",
+            "kiro-cli settings chat.disableInheritingDefaultResources false",
             proc.stderr.decode(),
         )
 
@@ -1739,6 +1779,128 @@ class OverlayContextTest(unittest.TestCase):
     def hook_body(self, proc):
         return json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
 
+    def claude_bridge_repo(self):
+        repo = self.init_repo("claude-bridge-repo")
+        (repo / "AGENTS.md").write_text("# shared\ncodename bluebird\n", encoding="utf-8")
+        (repo / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        (repo / ".gitignore").write_text(
+            "AGENTS.local.md\nCLAUDE.local.md\n.kiro/steering/agents-local-overlay.md\n",
+            encoding="utf-8",
+        )
+        self.commit(repo, "AGENTS.md", "CLAUDE.md", ".gitignore")
+        (repo / "AGENTS.local.md").write_text("# local\nmarker emerald-42\n", encoding="utf-8")
+        (repo / "CLAUDE.local.md").write_text("@AGENTS.local.md\n", encoding="utf-8")
+        return repo
+
+    def claude_session(self, repo, env=None):
+        return self.overlay(
+            repo,
+            "json",
+            "SessionStart",
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            ".",
+            "claude-session",
+            stdin=json.dumps({"cwd": str(repo)}).encode(),
+            env=env,
+        )
+
+    def claude_config_env(self, body):
+        config_dir = Path(tempfile.mkdtemp(dir=self.root, prefix="claude-config-"))
+        (config_dir / "settings.json").write_text(body, encoding="utf-8")
+        return {"CLAUDE_CONFIG_DIR": str(config_dir)}
+
+    def write_project_claude_settings(self, repo, name, value):
+        settings_dir = repo / ".claude"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        (settings_dir / name).write_text(value, encoding="utf-8")
+
+    def test_claude_user_excluding_shared_bridge_withholds_runtime_rules(self):
+        repo = self.claude_bridge_repo()
+        env = self.claude_config_env('{"claudeMdExcludes": ["CLAUDE.md"]}')
+
+        proc = self.claude_session(repo, env=env)
+
+        body = self.hook_body(proc)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("Claude claudeMdExcludes excludes CLAUDE.md", body)
+        self.assertNotIn("codename bluebird", body)
+        self.assertNotIn("marker emerald-42", body)
+
+    def test_claude_project_excluding_local_bridge_withholds_runtime_and_fails_verify(self):
+        repo = self.claude_bridge_repo()
+        self.write_project_claude_settings(
+            repo, "settings.json", '{"claudeMdExcludes": ["**/CLAUDE.local.md"]}'
+        )
+
+        runtime = self.claude_session(repo)
+        verify = self.overlay(repo, "verify")
+
+        body = self.hook_body(runtime)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("Claude claudeMdExcludes excludes CLAUDE.local.md", body)
+        self.assertNotIn("codename bluebird", body)
+        self.assertNotIn("marker emerald-42", body)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn(
+            "Claude claudeMdExcludes excludes CLAUDE.local.md", verify.stdout.decode()
+        )
+
+    def test_claude_nonmatching_excludes_preserve_normal_runtime_and_verify(self):
+        repo = self.claude_bridge_repo()
+        env = self.claude_config_env('{"claudeMdExcludes": ["docs/OTHER.md"]}')
+
+        runtime = self.claude_session(repo, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        self.assertEqual(runtime.returncode, 0, runtime.stderr.decode())
+        self.assertEqual(runtime.stdout, b"")
+        self.assertEqual(verify.returncode, 0, verify.stdout.decode() + verify.stderr.decode())
+
+    def test_claude_nonlist_excludes_withholds_runtime_and_fails_verify(self):
+        repo = self.claude_bridge_repo()
+        env = self.claude_config_env('{"claudeMdExcludes": "CLAUDE.md"}')
+
+        runtime = self.claude_session(repo, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        body = self.hook_body(runtime)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("could not verify Claude settings claudeMdExcludes", body)
+        self.assertNotIn("codename bluebird", body)
+        self.assertNotIn("marker emerald-42", body)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn("could not verify Claude settings claudeMdExcludes", verify.stdout.decode())
+
+    def test_claude_invalid_settings_json_withholds_runtime_and_fails_verify(self):
+        repo = self.claude_bridge_repo()
+        env = self.claude_config_env("{")
+
+        runtime = self.claude_session(repo, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        body = self.hook_body(runtime)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("could not verify Claude settings claudeMdExcludes", body)
+        self.assertNotIn("codename bluebird", body)
+        self.assertNotIn("marker emerald-42", body)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn("could not verify Claude settings claudeMdExcludes", verify.stdout.decode())
+
+    def test_claude_disable_mds_ignores_excludes_and_full_injects(self):
+        repo = self.claude_bridge_repo()
+        env = {
+            **self.claude_config_env('{"claudeMdExcludes": ["CLAUDE.md"]}'),
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+        }
+
+        proc = self.claude_session(repo, env=env)
+
+        body = self.hook_body(proc)
+        self.assertIn("codename bluebird", body)
+        self.assertIn("marker emerald-42", body)
+        self.assertNotIn("claudeMdExcludes", body)
+
     def test_codex_runtime_withholds_rules_without_codex_config(self):
         repo, hook = self.codex_repo()
 
@@ -2060,6 +2222,46 @@ class OverlayContextTest(unittest.TestCase):
         self.assertIn("nested rule scan", proc.stderr.decode())
         self.assertNotIn(b"bluebird", proc.stdout)
 
+    def test_kiro_launcher_policy_aborts_when_inheritance_key_absent(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(
+            repo,
+            "raw",
+            "SessionStart",
+            "cwd:AGENTS.md",
+            "-",
+            ".",
+            "kiro-launcher",
+            env=self.kiro_settings_cli_env("{}"),
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        err = proc.stderr.decode()
+        self.assertIn("chat.disableInheritingDefaultResources is absent", err)
+        self.assertIn("kiro-cli settings chat.disableInheritingDefaultResources false", err)
+        self.assertNotIn(b"bluebird", proc.stdout)
+
+    def test_kiro_launcher_policy_aborts_when_inheritance_is_true(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(
+            repo,
+            "raw",
+            "SessionStart",
+            "cwd:AGENTS.md",
+            "-",
+            ".",
+            "kiro-launcher",
+            env=self.kiro_settings_cli_env('{"chat.disableInheritingDefaultResources": true}'),
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        err = proc.stderr.decode()
+        self.assertIn("chat.disableInheritingDefaultResources is true", err)
+        self.assertIn("custom agents would not inherit AGENTS.md", err)
+        self.assertNotIn(b"bluebird", proc.stdout)
+
     @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0, "chmod unreadable as root")
     def test_kiro_launcher_policy_aborts_when_nested_scan_directory_unreadable(self):
         repo = self.clean_repo()
@@ -2246,6 +2448,64 @@ class OverlayContextTest(unittest.TestCase):
         out = proc.stdout.decode()
         self.assertNotIn("outside the verified window", out)
         self.assertNotIn("could not be determined", out)
+
+    def test_verify_warns_when_kiro_inheritance_key_absent(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(repo, "verify", env=self.kiro_settings_cli_env("{}"))
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
+        out = proc.stdout.decode()
+        self.assertIn("WARN", out)
+        self.assertIn("kiro-launcher: Kiro chat.disableInheritingDefaultResources is absent", out)
+        self.assertIn("kiro-cli settings chat.disableInheritingDefaultResources false", out)
+
+    def test_verify_warns_when_kiro_inheritance_is_true(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(
+            repo,
+            "verify",
+            env=self.kiro_settings_cli_env('{"chat.disableInheritingDefaultResources": true}'),
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
+        out = proc.stdout.decode()
+        self.assertIn("WARN", out)
+        self.assertIn("kiro-launcher: Kiro chat.disableInheritingDefaultResources is true", out)
+        self.assertIn("custom agents would not inherit AGENTS.md", out)
+
+    def test_setup_warns_when_kiro_inheritance_key_absent(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(repo, "setup", env=self.kiro_settings_cli_env("{}"))
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
+        out = proc.stdout.decode()
+        self.assertIn("WARN", out)
+        self.assertIn("kiro-launcher: Kiro chat.disableInheritingDefaultResources is absent", out)
+        self.assertIn("ok overlay setup", out)
+
+    def test_verify_has_no_kiro_inheritance_warning_when_explicit_false(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(
+            repo,
+            "verify",
+            env=self.kiro_settings_cli_env('{"chat.disableInheritingDefaultResources": false}'),
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
+        out = proc.stdout.decode()
+        self.assertNotIn("kiro-launcher: Kiro chat.disableInheritingDefaultResources", out)
+
+    def test_verify_skips_kiro_inheritance_check_without_kiro_cli(self):
+        repo = self.clean_repo()
+
+        proc = self.overlay(repo, "verify", env=self.cli_bin_env({"kiro-cli": None}))
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
+        self.assertNotIn("chat.disableInheritingDefaultResources", proc.stdout.decode())
 
     def test_verify_warns_on_codex_version_outside_window(self):
         repo = self.clean_repo()

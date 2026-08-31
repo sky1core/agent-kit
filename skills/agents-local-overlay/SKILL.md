@@ -218,13 +218,14 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
   현재 rule을 확인한다.
 - Claude hook은 stdin JSON의 `cwd`를 active worktree로 사용한다.
   `CLAUDE_PROJECT_DIR`는 source 판정 기준으로 쓰지 않는다.
-- Claude settings가 native bridge나 hook을 끄면 이 규약은 지원하지 않는다.
-  아래 CLI flag와 settings key는 전제의 검증 기준 버전에서 확인한 이름이다.
-  `claudeMdExcludes`가 `CLAUDE.md` / `CLAUDE.local.md`를 제외하지 않아야 하고,
-  CLI `--setting-sources` 또는 SDK `settingSources`를 지정할 때는 `project`와
-  `local`을 모두 포함해야 한다. `--bare`, `--safe-mode`,
-  `disableAllHooks=true`, managed settings의 `allowManagedHooksOnly=true`는 hook
-  또는 bridge를 꺼서 silent miss를 만들 수 있으므로 overlay 검증 대상이 아니다.
+- hook과 `verify`는 `$CLAUDE_CONFIG_DIR/settings.json`과 project
+  `.claude/settings.json` / `.claude/settings.local.json`을 읽어
+  `claudeMdExcludes`를 확인한다. `claudeMdExcludes`가 `CLAUDE.md` /
+  `CLAUDE.local.md` bridge를 제외하거나 settings를 JSON object로 검증할 수 없으면
+  runtime은 `Rules not injected` notice만 내고, `verify`는 FAIL한다.
+- CLI `--setting-sources` 또는 SDK `settingSources`에서 `project` / `local`을 빼는
+  상태, `--bare`, `--safe-mode`, `disableAllHooks=true`, managed settings의
+  `allowManagedHooksOnly=true`는 hook이 관찰할 수 없으므로 overlay 검증 경계 밖이다.
 - `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`이면 bridge가 꺼진 것이므로 hook이 공용과
   로컬 규칙을 모두 주입한다.
 - `SubagentStart`에서 `agent_type=fork`는 부모 context를 상속하므로 주입하지
@@ -337,9 +338,11 @@ command -v kiro-cli-overlay
 - `.kiro`, `.kiro/steering`, 생성 파일 중 하나라도 symlink면 중단한다.
 - 생성 파일이 tracked이거나 ignored가 아니면 중단한다.
 - launcher는 steering 파일을 쓰기 전에 `kiro-cli settings list --format json`으로
-  `chat.disableInheritingDefaultResources`를 확인한다. 값이 `true`이거나 설정을
-  JSON object로 검증할 수 없으면 custom agent가 `AGENTS.md`를 상속한다는 전제가
-  성립하지 않으므로 중단한다.
+  `chat.disableInheritingDefaultResources`가 명시적으로 `false`인지 확인한다.
+  위 첫 번째 command가 이 값을 쓴다. key가 없거나, 값이 `true`이거나, boolean이
+  아니거나, 설정을 JSON object로 검증할 수 없으면 중단한다. key가 없거나 boolean이
+  아니면 `kiro-cli settings chat.disableInheritingDefaultResources false`를 실행해
+  다시 쓴다.
 - launcher는 실행 전에 worktree 전체를 스캔해 top 밖의 `AGENTS.md` 또는
   `AGENTS.override.md`가 발견되면 중단한다. Kiro 2.18+가 tree의 nested
   `AGENTS.md`를 자동 로드하는 동작에 대한 보수적 방어다.
@@ -385,6 +388,10 @@ agents-overlay-context verify
 - nested rule 스캔: worktree 전체에서 top 밖의 `AGENTS.md` /
   `AGENTS.override.md` 발견은 FAIL, 바운드 초과나 디렉터리 listing 실패로 미완이면
   WARN이다.
+- Kiro inheritance setting: `kiro-cli`가 설치되어 있으면
+  `chat.disableInheritingDefaultResources`가 명시적으로 `false`인지 검사한다. key
+  없음, `true`, non-bool, 검증 불가는 Tier 2 WARN으로 보고한다. `kiro-cli`가 PATH에
+  없으면 이 검사는 건너뛴다.
 - worktree 중첩: 모든 worktree 쌍의 상호 중첩을 FAIL로 보고한다.
 - 대체 소스 dry-run: working tree에 `AGENTS.md`가 없을 때 실제로 읽게 될
   `HEAD:AGENTS.md`가 regular file(mode 100644/100755)의 NUL 없는 UTF-8이 아니면
@@ -471,6 +478,9 @@ command -v trash >/dev/null 2>&1 && trash "$overlay_tmp_root" || printf 'remove 
   스캔이 바운드나 디렉터리 listing 실패로 미완이면 `verify`는 WARN을 내고 Kiro
   launcher는 중단한다. 하위 디렉터리별 규칙이 필요하면 rule 파일이 아닌 일반 문서로
   두고 명시적으로 열게 한다.
+- Kiro shared `AGENTS.md` 전달은 Kiro native default-resource channel을 타며,
+  overlay는 explicit setting을 강제해 이를 guard한다. 이는 Claude bridge
+  canonicality와 Codex trust/config를 guard하는 방식과 같은 경계다.
 - worktree 중첩 금지는 primary 하위만이 아니라 모든 worktree 상호 간에 적용된다.
 - nested `CLAUDE.md`는 Claude의 native 기능이고 이 규약의 rule source 계약 밖이라
   스캔·검증하지 않는다. symlink 디렉터리 내부도 스캔이 따라가지 않는 한계가 있다.
