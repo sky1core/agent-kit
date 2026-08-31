@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -113,6 +114,52 @@ def ensure_target_safe(top: Path) -> tuple[Path, Path]:
     return steering_dir, target
 
 
+def verify_kiro_inheritance(kiro_bin: str, top: Path) -> None:
+    try:
+        proc = subprocess.run(
+            [kiro_bin, "settings", "list", "--format", "json"],
+            cwd=str(top),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise LauncherError(
+            "could not verify Kiro chat.disableInheritingDefaultResources setting"
+        ) from exc
+    except OSError as exc:
+        raise LauncherError(
+            "could not verify Kiro chat.disableInheritingDefaultResources setting"
+        ) from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        suffix = f": {detail}" if detail else ""
+        raise LauncherError(
+            "could not verify Kiro chat.disableInheritingDefaultResources setting" + suffix
+        )
+    try:
+        settings = json.loads(proc.stdout.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise LauncherError(
+            "could not verify Kiro chat.disableInheritingDefaultResources setting"
+        ) from exc
+    if not isinstance(settings, dict):
+        raise LauncherError(
+            "could not verify Kiro chat.disableInheritingDefaultResources setting"
+        )
+    value = settings.get("chat.disableInheritingDefaultResources", False)
+    if value is True:
+        raise LauncherError(
+            "Kiro chat.disableInheritingDefaultResources is true; custom agents would not "
+            "inherit AGENTS.md"
+        )
+    if value is not False:
+        raise LauncherError(
+            "could not verify Kiro chat.disableInheritingDefaultResources setting"
+        )
+
+
 def overlay_body(top: Path, core: Path) -> str:
     proc = subprocess.run(
         [
@@ -175,6 +222,7 @@ def main(argv: list[str]) -> int:
             raise LauncherError(f"missing helper: {core}")
         top = resolve_top()
         steering_dir, target = ensure_target_safe(top)
+        verify_kiro_inheritance(kiro_bin, top)
         write_target(steering_dir, target, overlay_body(top, core))
         os.chdir(top)
         try:

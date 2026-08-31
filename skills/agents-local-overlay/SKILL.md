@@ -336,6 +336,10 @@ command -v kiro-cli-overlay
 - 생성 파일은 launcher 전용 첫 줄이 있는 regular file이어야 한다.
 - `.kiro`, `.kiro/steering`, 생성 파일 중 하나라도 symlink면 중단한다.
 - 생성 파일이 tracked이거나 ignored가 아니면 중단한다.
+- launcher는 steering 파일을 쓰기 전에 `kiro-cli settings list --format json`으로
+  `chat.disableInheritingDefaultResources`를 확인한다. 값이 `true`이거나 설정을
+  JSON object로 검증할 수 없으면 custom agent가 `AGENTS.md`를 상속한다는 전제가
+  성립하지 않으므로 중단한다.
 - launcher는 실행 전에 worktree 전체를 스캔해 top 밖의 `AGENTS.md` 또는
   `AGENTS.override.md`가 발견되면 중단한다. Kiro 2.18+가 tree의 nested
   `AGENTS.md`를 자동 로드하는 동작에 대한 보수적 방어다.
@@ -444,15 +448,24 @@ command -v trash >/dev/null 2>&1 && trash "$overlay_tmp_root" || printf 'remove 
 - wrapper 또는 Python core 실행 자체가 실패하거나 Git inspection을 진행할 수 없으면
   hook 오류로 실패한다. Claude debug 로그, Codex hook event/session 로그, Kiro
   wrapper stderr에서 오류를 확인한 뒤 고치고 새 세션을 시작한다.
-- rule source가 symlink, non-UTF-8, `AGENTS.override.md`, linked worktree local file
-  위반처럼 overlay가 읽으면 안 되는 상태면 hook은 `[agents-local-overlay] Rule file
-  not loaded by overlay: ...` notice를 additional context로 넣고 overlay rule text는
-  넣지 않는다. notice를 보면 보고된 파일을 regular UTF-8 rule/bridge 계약에 맞게
-  고친 뒤 새 세션을 시작한다.
-- rule 파일 자체는 정상이어도 전제조건(Codex trust/config, top 밖 nested rule
+- rule source 하나가 symlink, non-UTF-8, NUL 포함, `HEAD:AGENTS.md` bad mode,
+  Codex `project_doc_max_bytes` 초과처럼 overlay가 읽거나 native 전달로 인정하면
+  안 되는 상태면 hook은 `[agents-local-overlay] Rule file not loaded by overlay:
+  ...` notice를 additional context로 넣고 그 rule의 text만 뺀다. 다른 healthy
+  rule source가 있으면 그 text는 같은 additional context에 계속 들어간다. notice를
+  보면 보고된 파일을 regular UTF-8 rule/bridge 계약에 맞게 고친 뒤 새 세션을
+  시작한다.
+- rule 파일 자체가 정상이어도 전제조건(Codex trust/config, top 밖 nested rule
   파일, worktree 중첩)이 확인되지 않으면 hook은 `[agents-local-overlay] Rules not
-  injected: ...` notice를 넣고 rule text는 넣지 않는다. 보고된 전제조건을 고친 뒤
-  새 세션을 시작한다.
+  injected: ...` notice를 넣고 모든 rule text를 넣지 않는다. 보고된 전제조건을
+  고친 뒤 새 세션을 시작한다.
+- Codex resume/compact 또는 subagent에서 session transcript를 확인할 수 없어
+  duplicate suppression 보증이 성립하지 않으면 hook은 cap 적용 뒤 다음 줄을 빈 줄
+  다음에 덧붙인다:
+  `[agents-local-overlay] Duplicate suppression could not be verified from the session transcript; these rules may repeat an earlier injection in this session.`
+  이 경고가 붙은 이전 injection도 다음번 transcript 확인에서 동일한 body로 인정해
+  다시 중복 주입하지 않는다. Codex `startup`/`clear` source에서는 이 경고를 붙이지
+  않는다.
 - worktree top 밖의 `AGENTS.md` / `AGENTS.override.md`는 지원하지 않는다. 발견되면
   Codex hook은 notice만 내고 `verify`는 실패하며 Kiro launcher는 중단한다. 전체
   스캔이 바운드나 디렉터리 listing 실패로 미완이면 `verify`는 WARN을 내고 Kiro

@@ -34,6 +34,10 @@ CLAUDE_POLICIES = ("default", "claude-session", "claude-subagent")
 CLAUDE_HOOK_POLICIES = ("claude-session", "claude-subagent")
 CLAUDE_WORKTREE_DIR_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR"
 CLAUDE_WORKTREE_BASE_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_BASE_REF"
+CODEX_DEDUPE_WARNING = (
+    "[agents-local-overlay] Duplicate suppression could not be verified from the "
+    "session transcript; these rules may repeat an earlier injection in this session."
+)
 
 
 class OverlayError(Exception):
@@ -62,6 +66,12 @@ class NativeSpec:
 @dataclass(frozen=True)
 class OverlayBody:
     text: str
+
+
+@dataclass(frozen=True)
+class CodexDedupeResult:
+    handled: bool
+    body: str
 
 
 def fail(message: str, code: int = 1) -> None:
@@ -953,6 +963,14 @@ def emit_json(event: str, body: str) -> None:
     sys.stdout.flush()
 
 
+def body_with_codex_dedupe_warning(body: str) -> str:
+    return body.rstrip("\n") + "\n\n" + CODEX_DEDUPE_WARNING
+
+
+def capped_codex_dedupe_warning_body(body: str, policy: str) -> str:
+    return apply_cap(body_with_codex_dedupe_warning(body), "json", policy).text
+
+
 def message_body_state(item: object, body: str) -> Tuple[bool, bool]:
     if not isinstance(item, dict):
         return False, False
@@ -980,7 +998,11 @@ def message_body_state(item: object, body: str) -> Tuple[bool, bool]:
         text = content.get("text")
         if not isinstance(text, str):
             return False, False
-        if role == "developer" and text.rstrip("\n") == body.rstrip("\n"):
+        body_variants = {
+            body.rstrip("\n"),
+            body_with_codex_dedupe_warning(body).rstrip("\n"),
+        }
+        if role == "developer" and text.rstrip("\n") in body_variants:
             present = True
     return True, present
 
@@ -1041,13 +1063,30 @@ def emit_generation(
     return True
 
 
-def maybe_skip_codex_dedupe(policy: str, hook_input: str, body: str, event: str) -> bool:
-    if policy not in ("codex-session", "codex-subagent"):
+def codex_dedupe_warning_applies(policy: str, hook_source: Optional[str], parsed: bool) -> bool:
+    if policy == "codex-subagent":
+        return True
+    if policy != "codex-session":
         return False
+    if not parsed:
+        return True
+    return hook_source in ("resume", "compact")
+
+
+def codex_dedupe_result(
+    policy: str, hook_input: str, body: str, event: str
+) -> CodexDedupeResult:
+    if policy not in ("codex-session", "codex-subagent"):
+        return CodexDedupeResult(handled=False, body=body)
     try:
         hook = json.loads(hook_input)
         if not isinstance(hook, dict):
             raise TypeError
+    except (ValueError, json.JSONDecodeError, TypeError):
+        if codex_dedupe_warning_applies(policy, None, False):
+            body = capped_codex_dedupe_warning_body(body, policy)
+        return CodexDedupeResult(handled=False, body=body)
+    try:
         hook_source = hook.get("source") if policy == "codex-session" else None
         inspect_transcript = policy == "codex-subagent" or hook_source in ("resume", "compact")
         present = False
@@ -1109,7 +1148,7 @@ def maybe_skip_codex_dedupe(policy: str, hook_input: str, body: str, event: str)
                             break
                         present = present or item_present
         if inspect_transcript and reliable and present:
-            return True
+            return CodexDedupeResult(handled=True, body=body)
         if reliable:
             source = hook_source if policy == "codex-session" else "subagent"
             reset = source in ("startup", "resume", "clear")
@@ -1120,7 +1159,7 @@ def maybe_skip_codex_dedupe(policy: str, hook_input: str, body: str, event: str)
             if policy == "codex-session" and source == "compact" and latest_window is None:
                 generation = None
             if emit_generation(hook, policy, body, generation, reset, event):
-                return True
+                return CodexDedupeResult(handled=True, body=body)
     except (
         OSError,
         UnicodeError,
@@ -1129,8 +1168,10 @@ def maybe_skip_codex_dedupe(policy: str, hook_input: str, body: str, event: str)
         AttributeError,
         TypeError,
     ):
-        return False
-    return False
+        reliable = False
+    if not reliable and codex_dedupe_warning_applies(policy, hook_source, True):
+        body = capped_codex_dedupe_warning_body(body, policy)
+    return CodexDedupeResult(handled=False, body=body)
 
 
 def parse_hook_object(hook_input: str, policy: str) -> dict:
@@ -1195,9 +1236,10 @@ def emit_command(argv: Sequence[str]) -> int:
     if format_name == "raw":
         sys.stdout.write(body.text)
         return 0
-    if maybe_skip_codex_dedupe(policy, hook_input, body.text, event):
+    dedupe = codex_dedupe_result(policy, hook_input, body.text, event)
+    if dedupe.handled:
         return 0
-    emit_json(event, body.text)
+    emit_json(event, dedupe.body)
     return 0
 
 
