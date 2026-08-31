@@ -13,6 +13,11 @@ repo의 rule source는 두 파일이다.
 목표는 하나다: 각 CLI가 네이티브로 읽지 못하는 규칙만 보충 경로가 전달한다.
 빠지면 agent가 규칙 없이 움직이고, 겹치면 같은 규칙이 context를 두 번 차지한다.
 
+이 규약의 보증은 "규칙이 누락·중복 없이 로드된다. 그렇게 하지 못하는 상태면
+runtime notice 또는 `verify` 실패로 가시적으로 드러난다"이다. CLI가 native로
+읽어줄 것이라는 예측은 전부 검사 가능한 전제조건으로 강제하며, 전제조건을
+확인할 수 없으면 rule을 조용히 빼는 대신 notice를 낸다.
+
 ## 지원 등급
 
 | 등급 | 대상 | 방식 |
@@ -28,9 +33,13 @@ resume/compact의 exact-once 증거가 runtime 로그에 없으면 미검증으�
 
 ## 전제
 
-- `git` 2.36 이상과 `python3` 3.9 이상이 필요하다.
-- 검증 기준 버전은 Claude Code 2.1.232-2.1.235, Codex CLI 0.147.0,
-  Kiro CLI package 2.15.1의 v3 engine이다.
+- `git` 2.36 이상과 `python3` 3.11 이상(`tomllib` 필요)이 필요하다.
+- live 검증 범위는 Claude Code 2.1.232-2.1.235, Codex CLI 0.147.0,
+  Kiro CLI package 2.15.1의 v3 engine이다. Codex 0.150+의 untrusted discovery
+  skip과 Kiro 2.18+의 nested `AGENTS.md` 로드는 설계에만 반영했고 deterministic
+  test로만 검증했다. 이 버전들에서 live 동작을 확인하면 검증 윈도우를 넓힌다.
+- `verify`는 설치된 `claude`, `codex`, `kiro-cli`의 `--version`을 확인해 검증
+  윈도우 밖이거나 버전을 판정할 수 없으면 WARN을 낸다. 미설치 CLI는 건너뛴다.
 - `AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`는 NUL이 없는
   UTF-8 regular file이어야 한다. rule 파일과 bridge 파일의 symlink는 읽지 않는다.
 - `AGENTS.override.md`는 overlay로 쓰지 않는다. Codex가 같은 디렉터리의
@@ -61,8 +70,11 @@ worktree가 공유한다. 위치는 `git worktree list --porcelain -z`의 첫 `w
 linked worktree의 현재 checkout에는 `AGENTS.local.md`나 `CLAUDE.local.md`를 두지
 않는다. 로컬 source와 local Claude bridge(`@AGENTS.local.md`)는 primary source
 위치에만 둔다. linked worktree의 Claude 세션에는 hook이 primary `AGENTS.local.md`를
-주입한다. linked worktree는 primary worktree 하위에 두지 않는다. parent rule
-discovery가 primary bridge를 추가로 읽으면 중복 또는 누락 판단이 불가능해진다.
+주입한다. worktree는 서로 어떤 조합으로도 중첩하지 않는다(primary 하위의 linked
+worktree, linked worktree 하위의 다른 linked worktree 모두 금지). parent rule
+discovery가 바깥 worktree의 rule을 추가로 읽으면 중복 또는 누락 판단이 불가능해
+진다. 중첩이 발견되면 hook은 rule을 주입하지 않고 notice만 내며 `verify`가
+모든 worktree 쌍을 검사해 실패한다.
 Claude `--worktree` 기본값은 `.claude/worktrees/` 아래에 worktree를 만들기 때문에
 아래 `WorktreeCreate` hook을 설정해 primary 밖의 경로를 쓰거나, 수동으로
 `git worktree add ../<repo>-<name>`처럼 primary 밖에 만든 worktree에서 Claude를
@@ -232,8 +244,9 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
 
 ## Codex CLI
 
-`~/.codex/config.toml`에 추가한다. 같은 key가 이미 있으면 중복 key를 만들지 말고
-기존 값을 조정한다.
+`~/.codex/config.toml`에 추가한다(`CODEX_HOME`이 설정돼 있으면 그 아래
+`config.toml`이며, hook과 `verify`도 같은 위치를 읽는다). 같은 key가 이미 있으면
+중복 key를 만들지 말고 기존 값을 조정한다.
 
 ```toml
 project_doc_max_bytes = 32768
@@ -259,17 +272,36 @@ additionalContextLimit = 0
   native로 받으므로 `SubagentStart`도 shared native source를 `AGENTS.md`로 둔다.
   hook command 인자의 `-`는 해당 native source가 없으므로 hook이 필요한 규칙을 직접
   주입해야 한다는 뜻이다.
+- repo가 Codex에서 trusted여야 한다. trust는 project root 경로 단위이므로 linked
+  worktree를 쓰면 각 worktree 경로를 각각 trust한다. 현재 worktree top이
+  `config.toml`의 `[projects."<path>"] trust_level = "trusted"`와 일치하지 않으면
+  (항목 없음, untrusted, config 파일 없음, 파싱 불가 포함) hook은 공용·로컬 rule을
+  모두 주입하지 않고 notice만 낸다. Codex 0.150 미만에서는 untrusted repo라도
+  공용 `AGENTS.md`가 native로 로드되지만, hook은 같은 기준으로 로컬 rule을 빼고
+  notice를 내므로 누락이 조용히 지나가지는 않는다.
+- config에 `project_root_markers` key를 두지 않는다. 이 key가 있으면 Codex의
+  project root 판정이 이 규약의 전제와 달라질 수 있으므로 hook은 rule을 주입하지
+  않고 `verify`가 실패한다.
+- worktree top 밖 하위 디렉터리에 `AGENTS.md`나 `AGENTS.override.md`를 두지
+  않는다. top에서 세션 cwd까지의 경로에서 발견되면 Codex native context에 계약 밖
+  파일이 섞이므로 hook은 rule을 주입하지 않고 notice만 낸다. `verify`와 `setup`은
+  worktree 전체를 스캔해 top 밖의 해당 파일 이름을 실패로 보고한다.
 - Codex가 네이티브로 읽는 `AGENTS.md`는 `project_doc_max_bytes` 이하여야 한다.
-  이 규약의 기준은 32768 bytes다. 넘으면 hook이 잘린 prefix와 remainder를
-  분리해 복구할 수 없으므로 runtime notice를 내고 `verify`가 실패한다.
-- Codex config에서 `project_doc_max_bytes`를 올린 환경만
-  `AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES`를 같은 byte 값으로 맞춰
-  `setup`/`verify` 기준을 올릴 수 있다.
+  기준값은 config의 실제 값이고, key가 없으면 기본 32768 bytes다. 넘으면 hook이
+  잘린 prefix와 remainder를 분리해 복구할 수 없으므로 runtime notice를 내고
+  `verify`가 실패한다.
+- `AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES`는 한도를 올리는 수단이 아니라
+  config 값과의 교차확인이다. 설정돼 있으면 config의 `project_doc_max_bytes`
+  유효값과 정확히 같아야 하고, 다르면 hook은 rule을 주입하지 않고 `verify`가
+  실패한다. 이전 버전에서 이 env로 기준을 올려 쓰고 있었다면 config 값을 올린 뒤
+  env를 지우거나 같은 값으로 맞춘다.
 - v1에서 큰 hook context를 쓰고 있었다면 아래 runtime cap 기준에 맞게
   `AGENTS.md` / `AGENTS.local.md`를 줄인 뒤 업그레이드한다. 이 버전은 전문을 잘라
   넣지 않고 cap 초과 notice로 실패를 드러낸다.
-- `project_doc_fallback_filenames`에 `AGENTS.local.md`를 넣지 않는다. fallback은
-  `AGENTS.md`가 없는 자리의 대체 파일이므로 local overlay 병합에 쓰면 중복된다.
+- `project_doc_fallback_filenames`는 `[]`로 두거나 key를 생략한다(문서화된 기본값
+  `[]`). 다른 값이 있으면 fallback 파일이 `AGENTS.md` 자리를 대체해 중복·누락
+  판정이 불가능해지므로 hook은 rule을 주입하지 않고 `verify`가 실패한다. 특히
+  `AGENTS.local.md`를 넣지 않는다.
 - `additionalContextLimit = 0`을 쓰되 runtime core가 자체 cap을 건다. 기본 cap은
   Claude 10000자, Codex 32768자, raw/Kiro 32768자다. 필요하면
   `AGENTS_OVERLAY_MAX_CHARS`로 Codex/raw/Kiro cap을 명시적으로 올린다. Claude cap은
@@ -304,6 +336,14 @@ command -v kiro-cli-overlay
 - 생성 파일은 launcher 전용 첫 줄이 있는 regular file이어야 한다.
 - `.kiro`, `.kiro/steering`, 생성 파일 중 하나라도 symlink면 중단한다.
 - 생성 파일이 tracked이거나 ignored가 아니면 중단한다.
+- launcher는 실행 전에 worktree 전체를 스캔해 top 밖의 `AGENTS.md` 또는
+  `AGENTS.override.md`가 발견되면 중단한다. Kiro 2.18+가 tree의 nested
+  `AGENTS.md`를 자동 로드하는 동작에 대한 보수적 방어다.
+- 스캔은 방문 entry 수를 기본 200000으로 제한한다. 바운드에 걸리거나 디렉터리
+  listing이 실패하면 nested rule 부재를 보증할 수 없으므로 launcher는 중단한다.
+  대형 repo는
+  `AGENTS_OVERLAY_SCAN_MAX_ENTRIES`를 양의 정수로 올려 전체 스캔을 통과시킨다.
+  값이 정수가 아니면 실행이 실패한다.
 - workspace에서 `chat.disableInheritingDefaultResources=true`이면 custom agent가
   `AGENTS.md`를 받지 않으므로 지원 조건을 벗어난다.
 - raw `kiro-cli`와 `kiro-cli chat --no-interactive`는 overlay 동기화를 우회하므로
@@ -328,6 +368,28 @@ repo 적용 후에는 대상 repo에서 다음을 실행한다.
 ```bash
 agents-overlay-context verify
 ```
+
+`verify`는 기존 ignore/tracking/symlink/bridge/override/cap 검사에 더해 다음을
+검사한다.
+
+- Codex config: `CODEX_HOME`(기본 `~/.codex`)의 `config.toml`이 존재할 때만
+  검사한다. 파싱 불가, `project_root_markers` 존재,
+  `project_doc_fallback_filenames` 위반, env-config 불일치는 FAIL이고, 현재 repo의
+  trust 항목 부재는 WARN이다(첫 Codex 세션에서 trust가 생길 수 있으므로).
+  config가 없으면 Codex 검사를 전부 건너뛴다. 이 경우 Codex를 실제로 쓰면 첫
+  세션의 runtime notice가 잡아준다.
+- nested rule 스캔: worktree 전체에서 top 밖의 `AGENTS.md` /
+  `AGENTS.override.md` 발견은 FAIL, 바운드 초과나 디렉터리 listing 실패로 미완이면
+  WARN이다.
+- worktree 중첩: 모든 worktree 쌍의 상호 중첩을 FAIL로 보고한다.
+- 대체 소스 dry-run: working tree에 `AGENTS.md`가 없을 때 실제로 읽게 될
+  `HEAD:AGENTS.md`가 regular file(mode 100644/100755)의 NUL 없는 UTF-8이 아니면
+  FAIL이다.
+- CLI 버전: 검증 윈도우 밖이거나 판정 불가면 WARN이다.
+
+FAIL은 규칙 전달 보증이 깨진 상태라 고쳐야 세션을 신뢰할 수 있다. WARN은 보증이
+"검증되지 않은" 상태다. 동작이 고장났다는 뜻이 아니라 이 규약이 그 조합을 검증한
+적이 없다는 뜻이므로, 원인을 확인하고 해소하거나 감수 여부를 결정한다.
 
 live 확인은 canary가 들어간 임시 repo에서 한다. Codex는 먼저 `/hooks`에서
 `SessionStart`와 `SubagentStart` hook이 trusted 상태인지 확인한다.
@@ -387,6 +449,18 @@ command -v trash >/dev/null 2>&1 && trash "$overlay_tmp_root" || printf 'remove 
   not loaded by overlay: ...` notice를 additional context로 넣고 overlay rule text는
   넣지 않는다. notice를 보면 보고된 파일을 regular UTF-8 rule/bridge 계약에 맞게
   고친 뒤 새 세션을 시작한다.
+- rule 파일 자체는 정상이어도 전제조건(Codex trust/config, top 밖 nested rule
+  파일, worktree 중첩)이 확인되지 않으면 hook은 `[agents-local-overlay] Rules not
+  injected: ...` notice를 넣고 rule text는 넣지 않는다. 보고된 전제조건을 고친 뒤
+  새 세션을 시작한다.
+- worktree top 밖의 `AGENTS.md` / `AGENTS.override.md`는 지원하지 않는다. 발견되면
+  Codex hook은 notice만 내고 `verify`는 실패하며 Kiro launcher는 중단한다. 전체
+  스캔이 바운드나 디렉터리 listing 실패로 미완이면 `verify`는 WARN을 내고 Kiro
+  launcher는 중단한다. 하위 디렉터리별 규칙이 필요하면 rule 파일이 아닌 일반 문서로
+  두고 명시적으로 열게 한다.
+- worktree 중첩 금지는 primary 하위만이 아니라 모든 worktree 상호 간에 적용된다.
+- nested `CLAUDE.md`는 Claude의 native 기능이고 이 규약의 rule source 계약 밖이라
+  스캔·검증하지 않는다. symlink 디렉터리 내부도 스캔이 따라가지 않는 한계가 있다.
 - native rule로 전달된다고 판단한 파일도 UTF-8/NUL 검증을 통과해야 한다. 검증에
   실패하면 hook은 native 전달로 보지 않고 notice를 넣는다.
 - Codex transcript format은 안정된 public contract가 아니다. major 업데이트 후에는

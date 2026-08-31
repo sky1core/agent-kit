@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -27,6 +28,8 @@ DEFAULT_CLAUDE_MAX_CHARS = 10000
 DEFAULT_RAW_MAX_CHARS = 32768
 CODEX_PROJECT_DOC_MAX_BYTES = 32768
 CODEX_PROJECT_DOC_MAX_BYTES_ENV = "AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES"
+DEFAULT_SCAN_MAX_ENTRIES = 200000
+SCAN_MAX_ENTRIES_ENV = "AGENTS_OVERLAY_SCAN_MAX_ENTRIES"
 CLAUDE_POLICIES = ("default", "claude-session", "claude-subagent")
 CLAUDE_HOOK_POLICIES = ("claude-session", "claude-subagent")
 CLAUDE_WORKTREE_DIR_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR"
@@ -47,6 +50,7 @@ class RepoContext:
     top: Path
     root: Path
     common: Path
+    worktrees: Tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -134,18 +138,23 @@ def resolve_context(project_dir: str, policy: str, require_git: bool = False) ->
         "git rev-parse --git-common-dir",
     )
 
-    worktrees = run_git(top, ["worktree", "list", "--porcelain", "-z"]).stdout.split(b"\0")
-    if not worktrees or not worktrees[0].startswith(b"worktree "):
+    records = run_git(top, ["worktree", "list", "--porcelain", "-z"]).stdout.split(b"\0")
+    if not records or not records[0].startswith(b"worktree "):
         raise OverlayError("could not resolve primary worktree")
-    try:
-        root = Path(worktrees[0][len(b"worktree ") :].decode("utf-8"))
-    except UnicodeDecodeError as exc:
-        raise OverlayError("primary worktree path is not UTF-8") from exc
+    worktrees: List[Path] = []
+    for record in records:
+        if not record.startswith(b"worktree "):
+            continue
+        try:
+            worktrees.append(Path(record[len(b"worktree ") :].decode("utf-8")))
+        except UnicodeDecodeError as exc:
+            raise OverlayError("worktree path is not UTF-8") from exc
+    root = worktrees[0]
     if not root.is_absolute():
         raise OverlayError("primary worktree path is not absolute")
     if not root.is_dir():
         raise OverlayError("primary worktree path is not a directory")
-    return RepoContext(start=start, top=top, root=root, common=common)
+    return RepoContext(start=start, top=top, root=root, common=common, worktrees=tuple(worktrees))
 
 
 def path_exists(path: Path) -> bool:
@@ -159,20 +168,23 @@ def same_file(left: Path, right: Path) -> bool:
         return False
 
 
-def path_is_descendant(path: Path, ancestor: Path) -> bool:
+def resolved_or_self(path: Path) -> Path:
     try:
-        path = path.resolve(strict=False)
+        return path.resolve(strict=False)
     except (OSError, RuntimeError):
-        pass
+        return path
+
+
+def path_is_within(path: Path, ancestor: Path) -> bool:
     try:
-        ancestor = ancestor.resolve(strict=False)
-    except (OSError, RuntimeError):
-        pass
-    try:
-        path.relative_to(ancestor)
+        resolved_or_self(path).relative_to(resolved_or_self(ancestor))
     except ValueError:
         return False
-    return path != ancestor
+    return True
+
+
+def path_is_descendant(path: Path, ancestor: Path) -> bool:
+    return path_is_within(path, ancestor) and resolved_or_self(path) != resolved_or_self(ancestor)
 
 
 def is_regular_readable_rule(path: Path) -> bool:
@@ -456,6 +468,300 @@ def strict_kiro_sources(ctx: RepoContext) -> None:
             read_rule(path)
 
 
+def codex_home() -> Path:
+    configured = os.environ.get("CODEX_HOME")
+    if configured:
+        return Path(configured)
+    return Path.home() / ".codex"
+
+
+@dataclass(frozen=True)
+class CodexConfig:
+    state: str
+    trust_levels: Tuple[Tuple[str, str], ...]
+    root_markers_present: bool
+    fallback_filenames: Optional[object]
+    project_doc_max_bytes: Optional[object]
+
+
+def load_codex_config() -> CodexConfig:
+    path = codex_home() / "config.toml"
+    if not path.is_file():
+        return CodexConfig(
+            state="missing",
+            trust_levels=(),
+            root_markers_present=False,
+            fallback_filenames=None,
+            project_doc_max_bytes=None,
+        )
+    try:
+        import tomllib
+    except ImportError:
+        state = "no-tomllib"
+        data = {}
+    else:
+        try:
+            with open(path, "rb") as config_file:
+                data = tomllib.load(config_file)
+            state = "ok"
+        except (OSError, ValueError, tomllib.TOMLDecodeError):
+            state = "unparseable"
+            data = {}
+    trust_levels: List[Tuple[str, str]] = []
+    projects = data.get("projects")
+    if isinstance(projects, dict):
+        for key, value in projects.items():
+            if isinstance(key, str) and isinstance(value, dict):
+                level = value.get("trust_level")
+                if isinstance(level, str):
+                    trust_levels.append((key, level))
+    return CodexConfig(
+        state=state,
+        trust_levels=tuple(trust_levels),
+        root_markers_present="project_root_markers" in data,
+        fallback_filenames=data.get("project_doc_fallback_filenames"),
+        project_doc_max_bytes=data.get("project_doc_max_bytes"),
+    )
+
+
+def effective_codex_project_doc_max_bytes(cfg: CodexConfig) -> int:
+    config_value = cfg.project_doc_max_bytes
+    if config_value is None:
+        effective = CODEX_PROJECT_DOC_MAX_BYTES
+    elif (
+        isinstance(config_value, int)
+        and not isinstance(config_value, bool)
+        and config_value > 0
+    ):
+        effective = config_value
+    else:
+        raise OverlayError(
+            f"{codex_home() / 'config.toml'} project_doc_max_bytes must be a positive integer"
+        )
+    env_value = os.environ.get(CODEX_PROJECT_DOC_MAX_BYTES_ENV)
+    if not env_value:
+        return effective
+    try:
+        parsed = int(env_value)
+    except ValueError as exc:
+        raise OverlayError(f"{CODEX_PROJECT_DOC_MAX_BYTES_ENV} must be an integer") from exc
+    if parsed <= 0:
+        raise OverlayError(f"{CODEX_PROJECT_DOC_MAX_BYTES_ENV} must be positive")
+    if parsed != effective:
+        raise OverlayError(
+            f"{CODEX_PROJECT_DOC_MAX_BYTES_ENV} is {parsed} but Codex config "
+            f"project_doc_max_bytes is {effective}; make them match or unset the env"
+        )
+    return effective
+
+
+def codex_config_refusals(cfg: CodexConfig) -> List[str]:
+    config_path = codex_home() / "config.toml"
+    if cfg.state == "no-tomllib":
+        return [
+            f"python3 tomllib is unavailable; python3 3.11+ is required to validate {config_path}"
+        ]
+    if cfg.state == "unparseable":
+        return [f"could not parse {config_path}; fix the TOML syntax"]
+    problems: List[str] = []
+    if cfg.root_markers_present:
+        problems.append(
+            f"{config_path} sets project_root_markers; remove that key, this overlay "
+            "requires default Codex project root discovery"
+        )
+    if cfg.fallback_filenames is not None and cfg.fallback_filenames != []:
+        problems.append(f"{config_path} must set project_doc_fallback_filenames = []")
+    try:
+        effective_codex_project_doc_max_bytes(cfg)
+    except OverlayError as exc:
+        problems.append(str(exc))
+    return problems
+
+
+def codex_trust_refusal(cfg: CodexConfig, top: Path) -> str:
+    resolved_top = os.path.realpath(str(top))
+    for key, level in cfg.trust_levels:
+        if os.path.realpath(key) == resolved_top and level == "trusted":
+            return ""
+    return f"project {top} is not trusted in Codex config; trust it in Codex"
+
+
+def codex_chain_rule_findings(ctx: RepoContext) -> List[str]:
+    findings: List[str] = []
+    try:
+        rel = resolved_or_self(ctx.start).relative_to(resolved_or_self(ctx.top))
+    except ValueError:
+        return findings
+    current = ctx.top
+    for part in rel.parts:
+        current = current / part
+        try:
+            names = os.listdir(current)
+        except OSError as exc:
+            detail = exc.strerror or str(exc)
+            return [f"Codex rule chain cannot be inspected at {current}: {detail}"]
+        for name in sorted(names):
+            if name.lower() in ("agents.md", "agents.override.md"):
+                candidate = current / name
+                findings.append(
+                    f"{candidate} is between the worktree top and the session cwd; "
+                    "Codex reads project docs along that chain, so move its content "
+                    f"into {ctx.top / SHARED_RULE} or remove it"
+                )
+    return findings
+
+
+def codex_runtime_precondition_refusals(ctx: RepoContext) -> List[str]:
+    cfg = load_codex_config()
+    if cfg.state == "missing":
+        return [
+            f"Codex config {codex_home() / 'config.toml'} was not found; "
+            "codex native rule loading cannot be confirmed"
+        ]
+    refusals = codex_config_refusals(cfg)
+    if refusals:
+        return refusals
+    trust = codex_trust_refusal(cfg, ctx.top)
+    if trust:
+        return [trust]
+    return codex_chain_rule_findings(ctx)
+
+
+def codex_precondition_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
+    cfg = load_codex_config()
+    if cfg.state == "missing":
+        return [], []
+    problems = codex_config_refusals(cfg)
+    warnings: List[str] = []
+    if not problems:
+        trust = codex_trust_refusal(cfg, ctx.top)
+        if trust:
+            warnings.append(
+                f"{trust}; codex sessions receive only a notice until this project is trusted"
+            )
+    return problems, warnings
+
+
+@dataclass(frozen=True)
+class Resolution:
+    kind: str
+    text: str
+    refusal: str
+
+
+def resolve_shared_rule(ctx: RepoContext) -> Resolution:
+    top_shared = ctx.top / SHARED_RULE
+    if is_regular_readable_rule(top_shared):
+        text, refusal = read_rule_for_body(top_shared)
+        return Resolution(kind="worktree-top", text=text, refusal=refusal)
+    if path_exists(top_shared):
+        return Resolution(kind="worktree-top", text="", refusal=rule_refusal_detail(top_shared))
+    head_state, commit = head_rule_state(ctx)
+    if head_state == 0 and commit is not None:
+        try:
+            return Resolution(kind="head", text=read_head_rule(ctx, commit), refusal="")
+        except OverlayError as exc:
+            return Resolution(kind="head", text="", refusal=str(exc))
+    if head_state == 2:
+        raise OverlayError("could not inspect HEAD AGENTS.md")
+    head_refusal = (
+        f"{top_shared} is not a regular file in HEAD; "
+        f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
+    )
+    if head_state == 3:
+        return Resolution(kind="head", text="", refusal=head_refusal)
+    root_shared = ctx.root / SHARED_RULE
+    if ctx.root != ctx.top and path_exists(root_shared) and root_shared_rule_is_untracked(ctx):
+        if is_regular_readable_rule(root_shared):
+            text, refusal = read_rule_for_body(root_shared)
+            return Resolution(kind="root-untracked", text=text, refusal=refusal)
+        if not is_regular_readable_rule(root_shared):
+            return Resolution(
+                kind="root-untracked", text="", refusal=rule_refusal_detail(root_shared)
+            )
+    return Resolution(kind="none", text="", refusal="")
+
+
+def resolve_local_rule(ctx: RepoContext) -> Resolution:
+    local = ctx.root / LOCAL_RULE
+    if is_regular_readable_rule(local):
+        text, refusal = read_rule_for_body(local)
+        return Resolution(kind="root", text=text, refusal=refusal)
+    if path_exists(local):
+        return Resolution(kind="root", text="", refusal=rule_refusal_detail(local))
+    return Resolution(kind="none", text="", refusal="")
+
+
+def scan_max_entries() -> int:
+    env_value = os.environ.get(SCAN_MAX_ENTRIES_ENV)
+    if not env_value:
+        return DEFAULT_SCAN_MAX_ENTRIES
+    try:
+        parsed = int(env_value)
+    except ValueError as exc:
+        raise OverlayError(f"{SCAN_MAX_ENTRIES_ENV} must be an integer") from exc
+    if parsed <= 0:
+        raise OverlayError(f"{SCAN_MAX_ENTRIES_ENV} must be positive")
+    return parsed
+
+
+def scan_worktree_rule_files(top: Path) -> Tuple[List[str], List[str]]:
+    limit = scan_max_entries()
+    findings: List[str] = []
+    incomplete: List[str] = []
+
+    def on_walk_error(error: OSError) -> None:
+        target = getattr(error, "filename", None) or str(top)
+        detail = error.strerror or str(error)
+        incomplete.append(f"could not scan {target}: {detail}")
+
+    count = 0
+    for dirpath, dirnames, filenames in os.walk(top, onerror=on_walk_error):
+        dirnames[:] = [name for name in dirnames if name != ".git"]
+        rel_dir = os.path.relpath(dirpath, str(top))
+        for name in filenames:
+            if name == ".git":
+                continue
+            count += 1
+            if rel_dir != "." and name.lower() in ("agents.md", "agents.override.md"):
+                findings.append(os.path.join(rel_dir, name))
+        count += len(dirnames)
+        if count > limit:
+            incomplete.append(
+                f"stopped at {limit} entries, raise {SCAN_MAX_ENTRIES_ENV} to scan fully"
+            )
+            break
+    findings.sort()
+    return findings, incomplete
+
+
+def nested_rule_finding_problem(top: Path, findings: List[str]) -> str:
+    shown = ", ".join(findings[:10])
+    suffix = f" (+{len(findings) - 10} more)" if len(findings) > 10 else ""
+    return (
+        f"nested rule files exist under {top}: {shown}{suffix}; "
+        f"keep {SHARED_RULE} and AGENTS.override.md only at the worktree top"
+    )
+
+
+def nested_scan_incomplete_warning(top: Path, reason: str) -> str:
+    return (
+        f"nested rule scan under {top} is incomplete: {reason}; "
+        "nested rule absence is unverified"
+    )
+
+
+def nested_rule_problems(ctx: RepoContext) -> Tuple[List[str], List[str]]:
+    findings, incomplete = scan_worktree_rule_files(ctx.top)
+    problems: List[str] = []
+    warnings: List[str] = []
+    if findings:
+        problems.append(nested_rule_finding_problem(ctx.top, findings))
+    if incomplete:
+        warnings.append(nested_scan_incomplete_warning(ctx.top, incomplete[0]))
+    return problems, warnings
+
+
 def codex_override_refusal(ctx: RepoContext, policy: str) -> str:
     if policy not in ("codex-session", "codex-subagent"):
         return ""
@@ -475,8 +781,11 @@ def codex_native_size_refusal(ctx: RepoContext, policy: str, shared_native: str)
         size = path.stat().st_size
     except OSError as exc:
         return f"could not inspect size for {path}: {exc}"
+    cfg = load_codex_config()
+    if cfg.state != "ok":
+        return ""
     try:
-        max_bytes = codex_project_doc_max_bytes()
+        max_bytes = effective_codex_project_doc_max_bytes(cfg)
     except OverlayError as exc:
         return str(exc)
     if size <= max_bytes:
@@ -492,15 +801,29 @@ def build_body(
     shared_native: str,
     local_native: str,
     policy: str,
+    skip_preconditions: bool = False,
 ) -> str:
-    if policy == "kiro-launcher":
-        strict_kiro_sources(ctx)
-    linked_refusals = linked_worktree_local_overlay_problems(ctx)
-    if linked_refusals:
-        return rule_error_notice("; ".join(linked_refusals)) + "\n"
-    override_refusal = codex_override_refusal(ctx, policy)
-    if override_refusal:
-        return rule_error_notice(override_refusal) + "\n"
+    if not skip_preconditions:
+        nesting_refusals = worktree_nesting_problems(ctx)
+        if nesting_refusals:
+            return rules_withheld_notice("; ".join(nesting_refusals)) + "\n"
+        if policy == "kiro-launcher":
+            strict_kiro_sources(ctx)
+            findings, incomplete = scan_worktree_rule_files(ctx.top)
+            if findings:
+                raise OverlayError(nested_rule_finding_problem(ctx.top, findings))
+            if incomplete:
+                raise OverlayError(nested_scan_incomplete_warning(ctx.top, incomplete[0]))
+        linked_refusals = linked_worktree_local_overlay_problems(ctx)
+        if linked_refusals:
+            return rule_error_notice("; ".join(linked_refusals)) + "\n"
+        override_refusal = codex_override_refusal(ctx, policy)
+        if override_refusal:
+            return rule_error_notice(override_refusal) + "\n"
+        if policy in ("codex-session", "codex-subagent"):
+            codex_refusals = codex_runtime_precondition_refusals(ctx)
+            if codex_refusals:
+                return rules_withheld_notice("; ".join(codex_refusals)) + "\n"
 
     shared = ""
     shared_refused = ""
@@ -508,90 +831,37 @@ def build_body(
     size_refusal = codex_native_size_refusal(ctx, policy, shared_native)
     if size_refusal:
         shared_refused = size_refusal
-    elif shared_native != "-":
-        delivered, refused = native_delivery_state(
-            shared_spec, ctx.top / SHARED_RULE, ctx.root / SHARED_RULE
-        )
-        if refused:
-            shared_refused = refused
-        elif not delivered:
-            if is_regular_readable_rule(ctx.top / SHARED_RULE):
-                shared, shared_refused = read_rule_for_body(ctx.top / SHARED_RULE)
-            elif path_exists(ctx.top / SHARED_RULE):
-                shared_refused = rule_refusal_detail(ctx.top / SHARED_RULE)
-            else:
-                head_state, commit = head_rule_state(ctx)
-                if head_state == 0 and commit is not None:
-                    try:
-                        shared = read_head_rule(ctx, commit)
-                    except OverlayError as exc:
-                        shared_refused = str(exc)
-                elif head_state == 2:
-                    raise OverlayError("could not inspect HEAD AGENTS.md")
-                elif ctx.root != ctx.top and path_exists(ctx.root / SHARED_RULE):
-                    root_shared = ctx.root / SHARED_RULE
-                    if is_regular_readable_rule(root_shared) and root_shared_rule_is_untracked(ctx):
-                        shared, shared_refused = read_rule_for_body(root_shared)
-                    elif head_state == 3:
-                        shared_refused = (
-                            f"{ctx.top / SHARED_RULE} is not a regular file in HEAD; "
-                            f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
-                        )
-                    elif not is_regular_readable_rule(root_shared):
-                        shared_refused = rule_refusal_detail(root_shared)
-                elif head_state == 3:
-                    shared_refused = (
-                        f"{ctx.top / SHARED_RULE} is not a regular file in HEAD; "
-                        f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
-                    )
-    elif is_regular_readable_rule(ctx.top / SHARED_RULE):
-        shared, shared_refused = read_rule_for_body(ctx.top / SHARED_RULE)
-    elif path_exists(ctx.top / SHARED_RULE):
-        shared_refused = rule_refusal_detail(ctx.top / SHARED_RULE)
     else:
-        head_state, commit = head_rule_state(ctx)
-        if head_state == 0 and commit is not None:
-            try:
-                shared = read_head_rule(ctx, commit)
-            except OverlayError as exc:
-                shared_refused = str(exc)
-        elif head_state == 2:
-            raise OverlayError("could not inspect HEAD AGENTS.md")
-        elif ctx.root != ctx.top and path_exists(ctx.root / SHARED_RULE):
-            root_shared = ctx.root / SHARED_RULE
-            if is_regular_readable_rule(root_shared) and root_shared_rule_is_untracked(ctx):
-                shared, shared_refused = read_rule_for_body(root_shared)
-            elif head_state == 3:
-                shared_refused = (
-                    f"{ctx.top / SHARED_RULE} is not a regular file in HEAD; "
-                    f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
-                )
-            elif not is_regular_readable_rule(root_shared):
-                shared_refused = rule_refusal_detail(root_shared)
-        elif head_state == 3:
-            shared_refused = (
-                f"{ctx.top / SHARED_RULE} is not a regular file in HEAD; "
-                f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
+        needs_shared = shared_native == "-"
+        if not needs_shared:
+            delivered, refused = native_delivery_state(
+                shared_spec, ctx.top / SHARED_RULE, ctx.root / SHARED_RULE
             )
+            if refused:
+                shared_refused = refused
+            else:
+                needs_shared = not delivered
+        if needs_shared and not shared_refused:
+            resolution = resolve_shared_rule(ctx)
+            shared = resolution.text
+            shared_refused = resolution.refusal
 
     local_rules = ""
     local_refused = ""
     local_spec = native_spec(ctx, local_native, f"@{LOCAL_RULE}")
-    if local_native != "-":
+    needs_local = local_native == "-"
+    if not needs_local:
         delivered, refused = native_delivery_state(
             local_spec, ctx.top / LOCAL_RULE, ctx.root / LOCAL_RULE
         )
         if refused:
             local_refused = refused
-        elif not delivered:
-            if is_regular_readable_rule(ctx.root / LOCAL_RULE):
-                local_rules, local_refused = read_rule_for_body(ctx.root / LOCAL_RULE)
-            elif path_exists(ctx.root / LOCAL_RULE):
-                local_refused = rule_refusal_detail(ctx.root / LOCAL_RULE)
-    elif is_regular_readable_rule(ctx.root / LOCAL_RULE):
-        local_rules, local_refused = read_rule_for_body(ctx.root / LOCAL_RULE)
-    elif path_exists(ctx.root / LOCAL_RULE):
-        local_refused = rule_refusal_detail(ctx.root / LOCAL_RULE)
+        else:
+            needs_local = not delivered
+    if needs_local and not local_refused:
+        resolution = resolve_local_rule(ctx)
+        local_rules = resolution.text
+        local_refused = resolution.refusal
 
     parts: List[str] = []
     for text in (shared, local_rules):
@@ -611,6 +881,14 @@ def rule_error_notice(message: str) -> str:
         "[agents-local-overlay] Rule file not loaded by overlay: "
         f"{message}. "
         "Fix the reported overlay input, then start a new session."
+    )
+
+
+def rules_withheld_notice(message: str) -> str:
+    return (
+        "[agents-local-overlay] Rules not injected: "
+        f"{message}. "
+        "Fix the reported precondition, then start a new session."
     )
 
 
@@ -970,8 +1248,11 @@ def claude_worktree_create_command(argv: Sequence[str]) -> int:
     base_dir = claude_worktree_base_dir()
     repo_dir = base_dir / f"{repo_part}-{repo_key}"
     target = repo_dir / name
-    if is_worktree(ctx.root) and path_is_descendant(target, ctx.root):
-        raise OverlayError(f"worktree target must be outside primary worktree: {target}")
+    for existing in ctx.worktrees:
+        if path_is_within(target, existing):
+            raise OverlayError(
+                f"worktree target must be outside every existing worktree: {target}"
+            )
     if path_exists(target):
         raise OverlayError(f"worktree target already exists: {target}")
     prepare_dir(base_dir)
@@ -1196,9 +1477,6 @@ def linked_worktree_local_overlay_problems(ctx: RepoContext) -> List[str]:
     if ctx.root == ctx.top:
         return []
     problems: List[str] = []
-    layout_problem = linked_worktree_inside_primary_problem(ctx)
-    if layout_problem:
-        problems.append(layout_problem)
     if path_exists(ctx.top / LOCAL_RULE):
         problems.append(f"{ctx.top / LOCAL_RULE} must not exist in a linked worktree")
     bridge = linked_claude_local_native_path(ctx)
@@ -1207,48 +1485,49 @@ def linked_worktree_local_overlay_problems(ctx: RepoContext) -> List[str]:
     return problems
 
 
-def linked_worktree_inside_primary_problem(ctx: RepoContext) -> str:
-    if ctx.root == ctx.top or not is_worktree(ctx.root):
-        return ""
-    if not path_is_descendant(ctx.top, ctx.root):
-        return ""
+def worktree_nesting_remediation() -> str:
     return (
-        f"{ctx.top} is inside primary worktree {ctx.root}; "
-        "place linked worktrees outside the primary worktree or configure the Claude "
+        "place worktrees outside each other or configure the Claude "
         "WorktreeCreate hook from this skill; parent rule discovery can duplicate or mask "
         "overlay injection"
     )
 
 
-def rule_source_paths(ctx: RepoContext) -> List[Path]:
-    return list(dict.fromkeys(shared_rule_source_paths(ctx) + [ctx.root / LOCAL_RULE]))
-
-
-def rule_readability_problems(ctx: RepoContext) -> List[str]:
+def worktree_nesting_problems(ctx: RepoContext) -> List[str]:
     problems: List[str] = []
-    for path in rule_source_paths(ctx):
-        if path_exists(path):
-            try:
-                read_rule(path)
-            except OverlayError as exc:
-                problems.append(str(exc))
+    for other in ctx.worktrees:
+        if path_is_descendant(ctx.top, other):
+            problems.append(
+                f"{ctx.top} is inside another worktree {other}; "
+                + worktree_nesting_remediation()
+            )
     return problems
 
 
-def codex_project_doc_max_bytes() -> int:
-    env_value = os.environ.get(CODEX_PROJECT_DOC_MAX_BYTES_ENV)
-    if not env_value:
-        return CODEX_PROJECT_DOC_MAX_BYTES
-    try:
-        parsed = int(env_value)
-    except ValueError as exc:
-        raise OverlayError(f"{CODEX_PROJECT_DOC_MAX_BYTES_ENV} must be an integer") from exc
-    if parsed <= 0:
-        raise OverlayError(f"{CODEX_PROJECT_DOC_MAX_BYTES_ENV} must be positive")
-    return parsed
+def worktree_pair_nesting_problems(ctx: RepoContext) -> List[str]:
+    problems: List[str] = []
+    for inner in ctx.worktrees:
+        for outer in ctx.worktrees:
+            if inner != outer and path_is_descendant(inner, outer):
+                problems.append(
+                    f"worktree {inner} is inside another worktree {outer}; "
+                    + worktree_nesting_remediation()
+                )
+    return problems
+
+
+def rule_resolution_problems(ctx: RepoContext) -> List[str]:
+    problems: List[str] = []
+    for resolution in (resolve_shared_rule(ctx), resolve_local_rule(ctx)):
+        if resolution.refusal:
+            problems.append(resolution.refusal)
+    return problems
 
 
 def codex_native_size_problems(ctx: RepoContext) -> List[str]:
+    cfg = load_codex_config()
+    if cfg.state != "ok":
+        return []
     path = ctx.top / SHARED_RULE
     if not is_regular_readable_rule(path):
         return []
@@ -1257,7 +1536,7 @@ def codex_native_size_problems(ctx: RepoContext) -> List[str]:
     except OSError as exc:
         return [f"could not inspect size for {path}: {exc}"]
     try:
-        max_bytes = codex_project_doc_max_bytes()
+        max_bytes = effective_codex_project_doc_max_bytes(cfg)
     except OverlayError as exc:
         return [str(exc)]
     if size <= max_bytes:
@@ -1313,11 +1592,19 @@ def overlay_cap_findings(
             continue
         try:
             sim_ctx = (
-                RepoContext(start=ctx.top, top=ctx.top, root=ctx.root, common=ctx.common)
+                RepoContext(
+                    start=ctx.top,
+                    top=ctx.top,
+                    root=ctx.root,
+                    common=ctx.common,
+                    worktrees=ctx.worktrees,
+                )
                 if policy == "kiro-launcher"
                 else ctx
             )
-            body = build_body(sim_ctx, shared_native, local_native, policy)
+            body = build_body(
+                sim_ctx, shared_native, local_native, policy, skip_preconditions=True
+            )
             max_chars = max_chars_for(format_name, policy)
             if len(body) > max_chars:
                 finding = f"{label} overlay body is {len(body)} chars, above cap {max_chars}"
@@ -1334,6 +1621,64 @@ def overlay_cap_findings(
     return problems, warnings
 
 
+VERSION_WINDOWS = {
+    "claude": ((2, 1, 232), (2, 1, 235)),
+    "codex": ((0, 147, 0), (0, 147, 0)),
+    "kiro-cli": ((2, 15, 1), (2, 15, 1)),
+}
+
+
+def parse_cli_version(text: str) -> Optional[Tuple[int, int, int]]:
+    match = re.search(r"(\d+)\.(\d+)\.(\d+)", text)
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+
+
+def format_cli_version(version: Tuple[int, int, int]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+def cli_version_warnings() -> List[str]:
+    warnings: List[str] = []
+    for cli, (low, high) in VERSION_WINDOWS.items():
+        binary = shutil.which(cli)
+        if not binary:
+            continue
+        unknown = (
+            f"{cli} version could not be determined; "
+            "overlay behavior for this install is unverified"
+        )
+        try:
+            proc = subprocess.run(
+                [binary, "--version"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            warnings.append(unknown)
+            continue
+        if proc.returncode != 0:
+            warnings.append(unknown)
+            continue
+        text = proc.stdout.decode("utf-8", "replace")
+        if not text.strip():
+            text = proc.stderr.decode("utf-8", "replace")
+        version = parse_cli_version(text)
+        if version is None:
+            warnings.append(unknown)
+            continue
+        if not low <= version <= high:
+            warnings.append(
+                f"{cli} version {format_cli_version(version)} is outside the verified window "
+                f"{format_cli_version(low)}-{format_cli_version(high)}; "
+                "overlay behavior for this version is unverified"
+            )
+    return warnings
+
+
 def verify_context(ctx: RepoContext) -> Tuple[List[str], List[str]]:
     problems: List[str] = []
     warnings: List[str] = []
@@ -1347,6 +1692,7 @@ def verify_context(ctx: RepoContext) -> Tuple[List[str], List[str]]:
                 problems.append(f"could not inspect ignore state for {rel_path} in {repo}")
 
     problems.extend(local_tracking_problems(ctx))
+    problems.extend(worktree_pair_nesting_problems(ctx))
     problems.extend(linked_worktree_local_overlay_problems(ctx))
 
     for path in (ctx.top / ".kiro", ctx.top / ".kiro/steering", ctx.top / KIRO_STEERING_REL):
@@ -1384,8 +1730,15 @@ def verify_context(ctx: RepoContext) -> Tuple[List[str], List[str]]:
         else:
             warnings.append(f"{label} is missing; hook will inject that rule when needed")
 
-    problems.extend(rule_readability_problems(ctx))
+    problems.extend(rule_resolution_problems(ctx))
     problems.extend(codex_native_size_problems(ctx))
+    codex_problems, codex_warnings = codex_precondition_findings(ctx)
+    problems.extend(codex_problems)
+    warnings.extend(codex_warnings)
+    scan_problems, scan_warnings = nested_rule_problems(ctx)
+    problems.extend(scan_problems)
+    warnings.extend(scan_warnings)
+    warnings.extend(cli_version_warnings())
     cap_problems, cap_warnings = overlay_cap_findings(ctx)
     problems.extend(cap_problems)
     warnings.extend(cap_warnings)
@@ -1428,11 +1781,18 @@ def setup_context(ctx: RepoContext) -> int:
         if path_exists(path) and path.is_symlink():
             problems.append(f"{path} must not be a symlink")
     problems.extend(local_tracking_problems(ctx))
+    problems.extend(worktree_pair_nesting_problems(ctx))
     problems.extend(linked_worktree_local_overlay_problems(ctx))
     if path_exists(ctx.top / "AGENTS.override.md"):
         problems.append(f"{ctx.top / 'AGENTS.override.md'} must not exist for this overlay")
-    problems.extend(rule_readability_problems(ctx))
+    problems.extend(rule_resolution_problems(ctx))
     problems.extend(codex_native_size_problems(ctx))
+    codex_problems, codex_warnings = codex_precondition_findings(ctx)
+    problems.extend(codex_problems)
+    setup_warnings.extend(codex_warnings)
+    scan_problems, scan_warnings = nested_rule_problems(ctx)
+    problems.extend(scan_problems)
+    setup_warnings.extend(scan_warnings)
     cap_problems, cap_warnings = overlay_cap_findings(ctx, include_claude_session=False)
     problems.extend(cap_problems)
     setup_warnings.extend(cap_warnings)
