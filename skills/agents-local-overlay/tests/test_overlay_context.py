@@ -184,6 +184,66 @@ class OverlayContextTest(unittest.TestCase):
         self.assertIn("marker emerald-42", body)
         self.assertNotIn("# shared", body)
 
+    def test_claude_session_uses_hook_cwd_for_linked_local_overlay(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_text("# shared\ncodename bluebird\n", encoding="utf-8")
+        (repo / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        (repo / ".gitignore").write_text(
+            "AGENTS.local.md\nCLAUDE.local.md\n.kiro/steering/agents-local-overlay.md\n",
+            encoding="utf-8",
+        )
+        self.commit(repo, "AGENTS.md", "CLAUDE.md", ".gitignore")
+        (repo / "AGENTS.local.md").write_text("# local\nmarker emerald-42\n", encoding="utf-8")
+        (repo / "CLAUDE.local.md").write_text("@AGENTS.local.md\n", encoding="utf-8")
+        worktree = self.root / "linked-claude-session"
+        run(["git", "worktree", "add", "-q", str(worktree)], repo)
+        hook = {"cwd": str(worktree)}
+
+        proc = self.overlay(
+            repo,
+            "json",
+            "SessionStart",
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            str(repo),
+            "claude-session",
+            stdin=json.dumps(hook).encode(),
+        )
+
+        body = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("marker emerald-42", body)
+        self.assertNotIn("codename bluebird", body)
+
+    def test_claude_subagent_uses_hook_cwd_for_linked_local_overlay(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_text("# shared\ncodename bluebird\n", encoding="utf-8")
+        (repo / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        (repo / ".gitignore").write_text(
+            "AGENTS.local.md\nCLAUDE.local.md\n.kiro/steering/agents-local-overlay.md\n",
+            encoding="utf-8",
+        )
+        self.commit(repo, "AGENTS.md", "CLAUDE.md", ".gitignore")
+        (repo / "AGENTS.local.md").write_text("# local\nmarker emerald-42\n", encoding="utf-8")
+        (repo / "CLAUDE.local.md").write_text("@AGENTS.local.md\n", encoding="utf-8")
+        worktree = self.root / "linked-claude-subagent"
+        run(["git", "worktree", "add", "-q", str(worktree)], repo)
+        hook = {"cwd": str(worktree), "agent_type": "custom-agent"}
+
+        proc = self.overlay(
+            repo,
+            "json",
+            "SubagentStart",
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            str(repo),
+            "claude-subagent",
+            stdin=json.dumps(hook).encode(),
+        )
+
+        body = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("marker emerald-42", body)
+        self.assertNotIn("codename bluebird", body)
+
     def test_codex_resume_skips_when_body_is_already_in_active_transcript(self):
         repo = self.init_repo()
         (repo / "AGENTS.md").write_text("# shared\n", encoding="utf-8")
@@ -289,6 +349,42 @@ class OverlayContextTest(unittest.TestCase):
         self.assertIn(b"Rule file not loaded", proc.stdout)
         self.assertIn(b"not UTF-8", proc.stdout)
 
+    def test_non_utf8_codex_native_rule_outputs_notice(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_bytes(b"\xff")
+        self.commit(repo, "AGENTS.md")
+        hook = {"source": "startup", "session_id": "s1", "turn_id": "t1"}
+
+        proc = self.overlay(
+            repo,
+            "json",
+            "SessionStart",
+            "AGENTS.md",
+            "-",
+            ".",
+            "codex-session",
+            stdin=json.dumps(hook).encode(),
+        )
+
+        body = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("Rule file not loaded", body)
+        self.assertIn("not UTF-8", body)
+
+    def test_nul_claude_native_bridge_target_outputs_notice(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_bytes(b"bad\0rule\n")
+        (repo / "CLAUDE.md").write_text("@AGENTS.md\n", encoding="utf-8")
+        (repo / ".gitignore").write_text(
+            "AGENTS.local.md\nCLAUDE.local.md\n.kiro/steering/agents-local-overlay.md\n",
+            encoding="utf-8",
+        )
+        self.commit(repo, "AGENTS.md", "CLAUDE.md", ".gitignore")
+
+        proc = self.overlay(repo, "raw", "SessionStart", "CLAUDE.md", "-", ".")
+
+        self.assertIn(b"Rule file not loaded", proc.stdout)
+        self.assertIn(b"contains NUL", proc.stdout)
+
     def test_gitignored_shared_rule_is_read_from_primary_worktree(self):
         repo = self.init_repo()
         (repo / ".gitignore").write_text("AGENTS.md\nAGENTS.local.md\n", encoding="utf-8")
@@ -315,6 +411,53 @@ class OverlayContextTest(unittest.TestCase):
         proc = self.overlay(worktree, "raw", "SessionStart", "AGENTS.md", "-", ".")
 
         self.assertEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout, b"")
+
+    def test_setup_does_not_create_shared_bridge_from_tracked_primary_agents(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_text("# shared\nprimary tracked\n", encoding="utf-8")
+        self.commit(repo, "AGENTS.md")
+        worktree = self.root / "drop-agents-setup"
+        run(["git", "worktree", "add", "-q", "-b", "drop-agents-setup", str(worktree)], repo)
+        (worktree / "AGENTS.md").unlink()
+        run(["git", "add", "AGENTS.md"], worktree)
+        run(["git", "commit", "-qm", "drop agents"], worktree)
+
+        proc = self.overlay(worktree, "setup")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
+        self.assertFalse((worktree / "CLAUDE.md").exists())
+        self.assertIn("ok overlay setup", proc.stdout.decode())
+
+    def test_linked_verify_ignores_invalid_tracked_primary_agents_removed_in_head(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_bytes(b"\xff")
+        self.commit(repo, "AGENTS.md")
+        worktree = self.root / "drop-agents-verify"
+        run(["git", "worktree", "add", "-q", "-b", "drop-agents-verify", str(worktree)], repo)
+        (worktree / "AGENTS.md").unlink()
+        run(["git", "add", "AGENTS.md"], worktree)
+        run(["git", "commit", "-qm", "drop agents"], worktree)
+
+        setup = self.overlay(worktree, "setup")
+        verify = self.overlay(worktree, "verify")
+
+        self.assertEqual(setup.returncode, 0, setup.stdout.decode() + setup.stderr.decode())
+        self.assertEqual(verify.returncode, 0, verify.stdout.decode() + verify.stderr.decode())
+
+    def test_linked_kiro_ignores_invalid_tracked_primary_agents_removed_in_head(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_bytes(b"\xff")
+        self.commit(repo, "AGENTS.md")
+        worktree = self.root / "drop-agents-kiro"
+        run(["git", "worktree", "add", "-q", "-b", "drop-agents-kiro", str(worktree)], repo)
+        (worktree / "AGENTS.md").unlink()
+        run(["git", "add", "AGENTS.md"], worktree)
+        run(["git", "commit", "-qm", "drop agents"], worktree)
+
+        proc = self.overlay(worktree, "raw", "SessionStart", "cwd:AGENTS.md", "-", ".", "kiro-launcher")
+
+        self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
         self.assertEqual(proc.stdout, b"")
 
     def test_linked_worktree_bad_local_agents_outputs_notice_without_primary_injection(self):
@@ -987,6 +1130,46 @@ class OverlayContextTest(unittest.TestCase):
         self.assertNotIn("WARN", verify.stdout.decode())
         self.assertEqual(setup.returncode, 0, setup.stdout.decode() + setup.stderr.decode())
 
+    def test_claude_worktree_create_places_checkout_outside_primary(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_text("# shared\n", encoding="utf-8")
+        self.commit(repo, "AGENTS.md")
+        target_root = self.root / "external-worktrees"
+        hook = {"cwd": str(repo), "name": "feature-a"}
+
+        proc = self.overlay(
+            repo,
+            "claude-worktree-create",
+            stdin=json.dumps(hook).encode(),
+            env={"AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR": str(target_root)},
+        )
+
+        target = Path(proc.stdout.decode().strip())
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        self.assertTrue(target.is_dir())
+        self.assertTrue(str(target).startswith(str(target_root.resolve())))
+        self.assertFalse(str(target).startswith(str(repo.resolve())))
+        git_top = run(["git", "rev-parse", "--show-toplevel"], target).stdout.decode().strip()
+        self.assertEqual(Path(git_top), target)
+
+    def test_claude_worktree_create_rejects_primary_descendant_target(self):
+        repo = self.init_repo()
+        (repo / "AGENTS.md").write_text("# shared\n", encoding="utf-8")
+        self.commit(repo, "AGENTS.md")
+        target_root = repo / ".claude" / "worktrees"
+        hook = {"cwd": str(repo), "name": "feature-a"}
+
+        proc = self.overlay(
+            repo,
+            "claude-worktree-create",
+            stdin=json.dumps(hook).encode(),
+            env={"AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR": str(target_root)},
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("worktree target must be outside primary worktree", proc.stderr.decode())
+        self.assertFalse(target_root.exists())
+
     def test_setup_preflights_blockers_before_writing_files(self):
         repo = self.init_repo()
         (repo / "AGENTS.md").write_text("# shared\n", encoding="utf-8")
@@ -1098,7 +1281,7 @@ class OverlayContextTest(unittest.TestCase):
             "CLAUDE.local.md",
             ".",
             "claude-subagent",
-            stdin=json.dumps({"agent_type": "fork"}).encode(),
+            stdin=json.dumps({"cwd": str(repo), "agent_type": "fork"}).encode(),
         )
 
         self.assertEqual(proc.returncode, 0)
@@ -1121,7 +1304,7 @@ class OverlayContextTest(unittest.TestCase):
             "CLAUDE.local.md",
             ".",
             "claude-subagent",
-            stdin=json.dumps({"agent_type": "Plan"}).encode(),
+            stdin=json.dumps({"cwd": str(repo), "agent_type": "Plan"}).encode(),
         )
 
         body = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]

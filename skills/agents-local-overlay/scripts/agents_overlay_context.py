@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -26,6 +27,10 @@ DEFAULT_CLAUDE_MAX_CHARS = 10000
 DEFAULT_RAW_MAX_CHARS = 32768
 CODEX_PROJECT_DOC_MAX_BYTES = 32768
 CODEX_PROJECT_DOC_MAX_BYTES_ENV = "AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES"
+CLAUDE_POLICIES = ("default", "claude-session", "claude-subagent")
+CLAUDE_HOOK_POLICIES = ("claude-session", "claude-subagent")
+CLAUDE_WORKTREE_DIR_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR"
+CLAUDE_WORKTREE_BASE_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_BASE_REF"
 
 
 class OverlayError(Exception):
@@ -65,6 +70,7 @@ def usage() -> str:
         [
             "usage:",
             "  agents-overlay-context <json|raw> <event> <shared-native> <local-native> [project-dir] [policy]",
+            "  agents-overlay-context claude-worktree-create",
             "  agents-overlay-context setup [project-dir]",
             "  agents-overlay-context verify [project-dir]",
             "",
@@ -155,11 +161,11 @@ def same_file(left: Path, right: Path) -> bool:
 
 def path_is_descendant(path: Path, ancestor: Path) -> bool:
     try:
-        path = path.resolve(strict=True)
+        path = path.resolve(strict=False)
     except (OSError, RuntimeError):
         pass
     try:
-        ancestor = ancestor.resolve(strict=True)
+        ancestor = ancestor.resolve(strict=False)
     except (OSError, RuntimeError):
         pass
     try:
@@ -195,6 +201,99 @@ def rule_refusal_detail(path: Path) -> str:
     return f"{path} is not a readable regular file"
 
 
+def read_regular_file_bytes(path: Path) -> bytes:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow == 0:
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise OverlayError(f"could not inspect rule file {path}: {exc}") from exc
+        if stat.S_ISLNK(mode):
+            raise OverlayError(rule_refusal_detail(path))
+    try:
+        fd = os.open(path, os.O_RDONLY | nofollow)
+    except OSError as exc:
+        raise OverlayError(rule_refusal_detail(path)) from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OverlayError(f"{path} is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def write_all(fd: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        written = os.write(fd, data[offset:])
+        if written == 0:
+            raise OverlayError("could not write file")
+        offset += written
+
+
+def open_regular_for_write(path: Path, flags: int, mode: int = 0o666) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if nofollow == 0 and path_exists(path):
+        try:
+            lstat_mode = path.lstat().st_mode
+        except OSError as exc:
+            raise OverlayError(f"could not inspect {path}: {exc}") from exc
+        if stat.S_ISLNK(lstat_mode):
+            raise OverlayError(f"{path} is a symlink")
+    try:
+        fd = os.open(path, flags | nofollow, mode)
+    except OSError as exc:
+        raise OverlayError(f"could not open {path} for writing: {exc}") from exc
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OverlayError(f"{path} is not a regular file")
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def create_regular_file(path: Path, data: bytes) -> None:
+    try:
+        fd = open_regular_for_write(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+        try:
+            write_all(fd, data)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise OverlayError(f"could not write {path}") from exc
+
+
+def rewrite_regular_file(path: Path, data: bytes) -> None:
+    try:
+        fd = open_regular_for_write(path, os.O_WRONLY | os.O_TRUNC)
+        try:
+            write_all(fd, data)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise OverlayError(f"could not write {path}") from exc
+
+
+def append_regular_file(path: Path, data: bytes) -> None:
+    try:
+        fd = open_regular_for_write(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        try:
+            write_all(fd, data)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise OverlayError(f"could not write {path}") from exc
+
+
 def decode_rule(data: bytes, desc: str) -> str:
     try:
         text = data.decode("utf-8")
@@ -206,12 +305,7 @@ def decode_rule(data: bytes, desc: str) -> str:
 
 
 def read_rule(path: Path) -> str:
-    if not is_regular_readable_rule(path):
-        raise OverlayError(rule_refusal_detail(path))
-    try:
-        return decode_rule(path.read_bytes(), str(path))
-    except OSError as exc:
-        raise OverlayError(f"could not read rule file: {path}") from exc
+    return decode_rule(read_regular_file_bytes(path), str(path))
 
 
 def read_head_rule(ctx: RepoContext, commit: str) -> str:
@@ -249,22 +343,22 @@ def bridge_data_likely_delivers_natively(data: bytes, marker: str) -> bool:
 
 def canonical_bridge(path: Path, marker: str) -> bool:
     try:
-        return bridge_data_is_exact(path.read_bytes(), marker)
-    except OSError:
+        return bridge_data_is_exact(read_regular_file_bytes(path), marker)
+    except OverlayError:
         return False
 
 
 def normalizable_bridge(path: Path, marker: str) -> bool:
     try:
-        return bridge_data_is_normalizable(path.read_bytes(), marker)
-    except OSError:
+        return bridge_data_is_normalizable(read_regular_file_bytes(path), marker)
+    except OverlayError:
         return False
 
 
 def likely_native_bridge(path: Path, marker: str) -> bool:
     try:
-        return bridge_data_likely_delivers_natively(path.read_bytes(), marker)
-    except OSError:
+        return bridge_data_likely_delivers_natively(read_regular_file_bytes(path), marker)
+    except OverlayError:
         return False
 
 
@@ -274,14 +368,30 @@ def native_spec(ctx: RepoContext, native: str, marker: str) -> NativeSpec:
     return NativeSpec(ctx.top / native, marker)
 
 
-def native_delivers(spec: NativeSpec, rule_here: Path, rule_root: Path) -> bool:
+def validate_rule(path: Path) -> str:
+    try:
+        read_rule(path)
+    except OverlayError as exc:
+        return str(exc)
+    return ""
+
+
+def native_delivery_state(spec: NativeSpec, rule_here: Path, rule_root: Path) -> Tuple[bool, str]:
+    if not path_exists(spec.path):
+        return False, ""
     if not is_regular_readable_rule(spec.path):
-        return False
+        return False, rule_refusal_detail(spec.path)
     if same_file(spec.path, rule_here) or same_file(spec.path, rule_root):
-        return True
+        refused = validate_rule(spec.path)
+        return refused == "", refused
     if spec.marker is None:
-        return False
-    return is_regular_readable_rule(rule_here) and likely_native_bridge(spec.path, spec.marker)
+        return False, ""
+    if not likely_native_bridge(spec.path, spec.marker):
+        return False, ""
+    if not path_exists(rule_here):
+        return False, ""
+    refused = validate_rule(rule_here)
+    return refused == "", refused
 
 
 def head_rule_state(ctx: RepoContext) -> Tuple[int, Optional[str]]:
@@ -328,10 +438,19 @@ def is_worktree(path: Path) -> bool:
     return proc.returncode == 0 and proc.stdout.strip() == b"true"
 
 
+def shared_rule_source_paths(ctx: RepoContext) -> List[Path]:
+    paths = [ctx.top / SHARED_RULE]
+    if (
+        ctx.root != ctx.top
+        and path_exists(ctx.root / SHARED_RULE)
+        and root_shared_rule_is_untracked(ctx)
+    ):
+        paths.append(ctx.root / SHARED_RULE)
+    return list(dict.fromkeys(paths))
+
+
 def strict_kiro_sources(ctx: RepoContext) -> None:
-    candidates = [ctx.top / SHARED_RULE, ctx.root / LOCAL_RULE]
-    if ctx.root != ctx.top:
-        candidates.append(ctx.root / SHARED_RULE)
+    candidates = shared_rule_source_paths(ctx) + [ctx.root / LOCAL_RULE]
     for path in candidates:
         if path_exists(path):
             read_rule(path)
@@ -389,14 +508,42 @@ def build_body(
     size_refusal = codex_native_size_refusal(ctx, policy, shared_native)
     if size_refusal:
         shared_refused = size_refusal
-    elif shared_native != "-" and native_delivers(
-        shared_spec, ctx.top / SHARED_RULE, ctx.root / SHARED_RULE
-    ):
-        pass
-    elif shared_native != "-" and path_exists(shared_spec.path) and not is_regular_readable_rule(
-        shared_spec.path
-    ):
-        shared_refused = rule_refusal_detail(shared_spec.path)
+    elif shared_native != "-":
+        delivered, refused = native_delivery_state(
+            shared_spec, ctx.top / SHARED_RULE, ctx.root / SHARED_RULE
+        )
+        if refused:
+            shared_refused = refused
+        elif not delivered:
+            if is_regular_readable_rule(ctx.top / SHARED_RULE):
+                shared, shared_refused = read_rule_for_body(ctx.top / SHARED_RULE)
+            elif path_exists(ctx.top / SHARED_RULE):
+                shared_refused = rule_refusal_detail(ctx.top / SHARED_RULE)
+            else:
+                head_state, commit = head_rule_state(ctx)
+                if head_state == 0 and commit is not None:
+                    try:
+                        shared = read_head_rule(ctx, commit)
+                    except OverlayError as exc:
+                        shared_refused = str(exc)
+                elif head_state == 2:
+                    raise OverlayError("could not inspect HEAD AGENTS.md")
+                elif ctx.root != ctx.top and path_exists(ctx.root / SHARED_RULE):
+                    root_shared = ctx.root / SHARED_RULE
+                    if is_regular_readable_rule(root_shared) and root_shared_rule_is_untracked(ctx):
+                        shared, shared_refused = read_rule_for_body(root_shared)
+                    elif head_state == 3:
+                        shared_refused = (
+                            f"{ctx.top / SHARED_RULE} is not a regular file in HEAD; "
+                            f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
+                        )
+                    elif not is_regular_readable_rule(root_shared):
+                        shared_refused = rule_refusal_detail(root_shared)
+                elif head_state == 3:
+                    shared_refused = (
+                        f"{ctx.top / SHARED_RULE} is not a regular file in HEAD; "
+                        f"replace HEAD:{SHARED_RULE} with a regular UTF-8 file"
+                    )
     elif is_regular_readable_rule(ctx.top / SHARED_RULE):
         shared, shared_refused = read_rule_for_body(ctx.top / SHARED_RULE)
     elif path_exists(ctx.top / SHARED_RULE):
@@ -430,14 +577,17 @@ def build_body(
     local_rules = ""
     local_refused = ""
     local_spec = native_spec(ctx, local_native, f"@{LOCAL_RULE}")
-    if local_native != "-" and native_delivers(
-        local_spec, ctx.top / LOCAL_RULE, ctx.root / LOCAL_RULE
-    ):
-        pass
-    elif local_native != "-" and path_exists(local_spec.path) and not is_regular_readable_rule(
-        local_spec.path
-    ):
-        local_refused = rule_refusal_detail(local_spec.path)
+    if local_native != "-":
+        delivered, refused = native_delivery_state(
+            local_spec, ctx.top / LOCAL_RULE, ctx.root / LOCAL_RULE
+        )
+        if refused:
+            local_refused = refused
+        elif not delivered:
+            if is_regular_readable_rule(ctx.root / LOCAL_RULE):
+                local_rules, local_refused = read_rule_for_body(ctx.root / LOCAL_RULE)
+            elif path_exists(ctx.root / LOCAL_RULE):
+                local_refused = rule_refusal_detail(ctx.root / LOCAL_RULE)
     elif is_regular_readable_rule(ctx.root / LOCAL_RULE):
         local_rules, local_refused = read_rule_for_body(ctx.root / LOCAL_RULE)
     elif path_exists(ctx.root / LOCAL_RULE):
@@ -473,7 +623,7 @@ def read_rule_for_body(path: Path) -> Tuple[str, str]:
 
 def max_chars_for(format_name: str, policy: str) -> int:
     default = DEFAULT_RAW_MAX_CHARS
-    if format_name == "json" and policy in ("default", "claude-subagent"):
+    if format_name == "json" and policy in CLAUDE_POLICIES:
         default = DEFAULT_CLAUDE_MAX_CHARS
     elif format_name == "json" and policy in ("codex-session", "codex-subagent"):
         default = DEFAULT_CODEX_MAX_CHARS
@@ -486,7 +636,7 @@ def max_chars_for(format_name: str, policy: str) -> int:
             raise OverlayError("AGENTS_OVERLAY_MAX_CHARS must be an integer") from exc
         if parsed <= 0:
             raise OverlayError("AGENTS_OVERLAY_MAX_CHARS must be positive")
-        if format_name == "json" and policy in ("default", "claude-subagent"):
+        if format_name == "json" and policy in CLAUDE_POLICIES:
             return min(parsed, DEFAULT_CLAUDE_MAX_CHARS)
         return parsed
     return default
@@ -496,7 +646,7 @@ def apply_cap(body: str, format_name: str, policy: str) -> OverlayBody:
     max_chars = max_chars_for(format_name, policy)
     if len(body) <= max_chars:
         return OverlayBody(text=body)
-    if format_name == "json" and policy in ("default", "claude-subagent"):
+    if format_name == "json" and policy in CLAUDE_POLICIES:
         remediation = (
             "Shorten AGENTS.md or AGENTS.local.md, then start a new session. "
             "Claude cap is not raised by AGENTS_OVERLAY_MAX_CHARS."
@@ -705,6 +855,23 @@ def maybe_skip_codex_dedupe(policy: str, hook_input: str, body: str, event: str)
     return False
 
 
+def parse_hook_object(hook_input: str, policy: str) -> dict:
+    try:
+        hook = json.loads(hook_input)
+    except (ValueError, TypeError) as exc:
+        raise OverlayError(f"policy {policy} requires JSON hook input") from exc
+    if not isinstance(hook, dict):
+        raise OverlayError(f"policy {policy} requires object hook input")
+    return hook
+
+
+def hook_cwd(hook: dict, policy: str) -> str:
+    cwd = hook.get("cwd")
+    if not isinstance(cwd, str) or not cwd:
+        raise OverlayError(f"policy {policy} requires hook cwd")
+    return cwd
+
+
 def prepare_hook_args(argv: Sequence[str]) -> Tuple[str, str, str, str, str, str, str]:
     if len(argv) < 4:
         fail("agents-overlay-context: missing arguments\n" + usage())
@@ -714,22 +881,20 @@ def prepare_hook_args(argv: Sequence[str]) -> Tuple[str, str, str, str, str, str
     project_dir = argv[4] if len(argv) >= 5 else "."
     policy = argv[5] if len(argv) >= 6 else "default"
     hook_input = ""
-    if policy in ("claude-subagent", "codex-session", "codex-subagent"):
+    if policy in (*CLAUDE_HOOK_POLICIES, "codex-session", "codex-subagent"):
         if format_name != "json":
             raise OverlayError(f"policy {policy} requires the json format")
         hook_input = sys.stdin.read()
+    if policy in CLAUDE_HOOK_POLICIES:
+        hook = parse_hook_object(hook_input, policy)
+        project_dir = hook_cwd(hook, policy)
     if policy == "claude-subagent":
-        try:
-            hook = json.loads(hook_input)
-            agent_type = hook.get("agent_type") if isinstance(hook, dict) else None
-        except (ValueError, TypeError, AttributeError):
-            agent_type = None
+        agent_type = hook.get("agent_type")
         if agent_type == "fork":
             raise QuietExit()
         if agent_type in ("Explore", "Plan") or not isinstance(agent_type, str) or not agent_type:
             shared_native = "-"
             local_native = "-"
-            project_dir = os.getcwd()
     if (
         os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
         and shared_native == CLAUDE_SHARED_BRIDGE
@@ -755,6 +920,66 @@ def emit_command(argv: Sequence[str]) -> int:
     if maybe_skip_codex_dedupe(policy, hook_input, body.text, event):
         return 0
     emit_json(event, body.text)
+    return 0
+
+
+def safe_slug(value: object, label: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise OverlayError(f"WorktreeCreate hook input missing {label}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}", value):
+        raise OverlayError(f"WorktreeCreate {label} must be a simple slug")
+    if value in (".", "..") or value.startswith(".") or value.endswith("."):
+        raise OverlayError(f"WorktreeCreate {label} must not be dot-like")
+    return value
+
+
+def slug_component(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-")
+    return safe or "repo"
+
+
+def claude_worktree_base_dir() -> Path:
+    configured = os.environ.get(CLAUDE_WORKTREE_DIR_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".cache" / "agents-local-overlay" / "claude-worktrees"
+
+
+def prepare_dir(path: Path) -> None:
+    if path_exists(path):
+        try:
+            mode = path.lstat().st_mode
+        except OSError as exc:
+            raise OverlayError(f"could not inspect directory {path}: {exc}") from exc
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            raise OverlayError(f"{path} is not a regular directory")
+        return
+    try:
+        path.mkdir(parents=True, exist_ok=False)
+    except OSError as exc:
+        raise OverlayError(f"could not create directory {path}: {exc}") from exc
+
+
+def claude_worktree_create_command(argv: Sequence[str]) -> int:
+    hook = parse_hook_object(sys.stdin.read(), "claude-worktree-create")
+    project_dir = hook_cwd(hook, "claude-worktree-create")
+    ctx = resolve_context(project_dir, "claude-worktree-create", require_git=True)
+    name = safe_slug(hook.get("name"), "name")
+    repo_part = slug_component(ctx.root.name)
+    repo_key = hashlib.sha256(str(ctx.common).encode("utf-8")).hexdigest()[:12]
+    base_dir = claude_worktree_base_dir()
+    repo_dir = base_dir / f"{repo_part}-{repo_key}"
+    target = repo_dir / name
+    if is_worktree(ctx.root) and path_is_descendant(target, ctx.root):
+        raise OverlayError(f"worktree target must be outside primary worktree: {target}")
+    if path_exists(target):
+        raise OverlayError(f"worktree target already exists: {target}")
+    prepare_dir(base_dir)
+    prepare_dir(repo_dir)
+    base_ref = os.environ.get(CLAUDE_WORKTREE_BASE_ENV, "HEAD")
+    branch = f"agents-overlay/{name}"
+    run_git(ctx.top, ["worktree", "add", "-q", "-b", branch, str(target), base_ref])
+    sys.stdout.write(str(target.resolve(strict=True)) + "\n")
     return 0
 
 
@@ -795,17 +1020,17 @@ def append_ignore_file_if_needed(
         if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
             raise OverlayError(f"{ignore_file} is not a regular file")
         try:
-            data = ignore_file.read_bytes()
-        except OSError as exc:
+            data = read_regular_file_bytes(ignore_file)
+        except OverlayError as exc:
             raise OverlayError(f"could not read {ignore_file}") from exc
     else:
         data = b""
     addition = pattern.encode("utf-8") + b"\n"
     if data and not data.endswith(b"\n"):
-        data += b"\n"
+        addition = b"\n" + addition
     try:
         ignore_file.parent.mkdir(parents=True, exist_ok=True)
-        ignore_file.write_bytes(data + addition)
+        append_regular_file(ignore_file, addition)
     except OSError as exc:
         raise OverlayError(f"could not write {ignore_file}") from exc
     changes.append(str(ignore_file))
@@ -827,10 +1052,11 @@ def append_info_exclude_if_needed(
 
 
 def ensure_bridge(path: Path, marker: str, changes: List[str], problems: List[str]) -> None:
+    data = (marker + "\n").encode("utf-8")
     if not path_exists(path):
         try:
-            path.write_bytes((marker + "\n").encode("utf-8"))
-        except OSError as exc:
+            create_regular_file(path, data)
+        except OverlayError as exc:
             raise OverlayError(f"could not write {path}") from exc
         changes.append(str(path))
         return
@@ -840,8 +1066,8 @@ def ensure_bridge(path: Path, marker: str, changes: List[str], problems: List[st
     if not canonical_bridge(path, marker):
         if normalizable_bridge(path, marker):
             try:
-                path.write_bytes((marker + "\n").encode("utf-8"))
-            except OSError as exc:
+                rewrite_regular_file(path, data)
+            except OverlayError as exc:
                 raise OverlayError(f"could not write {path}") from exc
             changes.append(str(path))
             return
@@ -951,7 +1177,11 @@ def shared_rule_source_exists(ctx: RepoContext) -> bool:
     head_state, _ = head_rule_state(ctx)
     if head_state in (0, 3):
         return True
-    return ctx.root != ctx.top and path_exists(ctx.root / SHARED_RULE)
+    return (
+        ctx.root != ctx.top
+        and path_exists(ctx.root / SHARED_RULE)
+        and root_shared_rule_is_untracked(ctx)
+    )
 
 
 def local_rule_source_exists(ctx: RepoContext) -> bool:
@@ -984,15 +1214,14 @@ def linked_worktree_inside_primary_problem(ctx: RepoContext) -> str:
         return ""
     return (
         f"{ctx.top} is inside primary worktree {ctx.root}; "
-        "place linked worktrees outside the primary worktree to avoid parent rule discovery "
-        "duplicating or masking overlay injection"
+        "place linked worktrees outside the primary worktree or configure the Claude "
+        "WorktreeCreate hook from this skill; parent rule discovery can duplicate or mask "
+        "overlay injection"
     )
 
 
 def rule_source_paths(ctx: RepoContext) -> List[Path]:
-    return list(
-        dict.fromkeys([ctx.top / SHARED_RULE, ctx.root / SHARED_RULE, ctx.root / LOCAL_RULE])
-    )
+    return list(dict.fromkeys(shared_rule_source_paths(ctx) + [ctx.root / LOCAL_RULE]))
 
 
 def rule_readability_problems(ctx: RepoContext) -> List[str]:
@@ -1037,6 +1266,34 @@ def codex_native_size_problems(ctx: RepoContext) -> List[str]:
         f"{path} is {size} bytes, above Codex project_doc_max_bytes {max_bytes}; "
         "shorten AGENTS.md before using this overlay"
     ]
+
+
+def acquire_setup_lock(ctx: RepoContext) -> Optional[Tuple[int, object]]:
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    fd = open_regular_for_write(
+        ctx.common / "agents-overlay-context.setup.lock",
+        os.O_RDWR | os.O_CREAT,
+        0o600,
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+    except Exception:
+        os.close(fd)
+        raise
+    return fd, fcntl
+
+
+def release_setup_lock(lock: Optional[Tuple[int, object]]) -> None:
+    if lock is None:
+        return
+    fd, fcntl_module = lock
+    try:
+        fcntl_module.flock(fd, fcntl_module.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 def overlay_cap_findings(
@@ -1135,9 +1392,7 @@ def verify_context(ctx: RepoContext) -> Tuple[List[str], List[str]]:
     return problems, warnings
 
 
-def setup_command(argv: Sequence[str]) -> int:
-    project_dir = argv[0] if argv else "."
-    ctx = resolve_context(project_dir, "setup", require_git=True)
+def setup_context(ctx: RepoContext) -> int:
     changes: List[str] = []
     problems: List[str] = []
     setup_warnings: List[str] = []
@@ -1221,6 +1476,16 @@ def setup_command(argv: Sequence[str]) -> int:
     return 0
 
 
+def setup_command(argv: Sequence[str]) -> int:
+    project_dir = argv[0] if argv else "."
+    ctx = resolve_context(project_dir, "setup", require_git=True)
+    lock = acquire_setup_lock(ctx)
+    try:
+        return setup_context(ctx)
+    finally:
+        release_setup_lock(lock)
+
+
 def verify_command(argv: Sequence[str]) -> int:
     project_dir = argv[0] if argv else "."
     ctx = resolve_context(project_dir, "verify", require_git=True)
@@ -1245,6 +1510,8 @@ def main(argv: Sequence[str]) -> int:
     try:
         if argv[0] in ("json", "raw"):
             return emit_command(argv)
+        if argv[0] == "claude-worktree-create":
+            return claude_worktree_create_command(argv[1:])
         if argv[0] == "setup":
             return setup_command(argv[1:])
         if argv[0] == "verify":

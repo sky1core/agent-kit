@@ -63,6 +63,10 @@ linked worktree의 현재 checkout에는 `AGENTS.local.md`나 `CLAUDE.local.md`�
 위치에만 둔다. linked worktree의 Claude 세션에는 hook이 primary `AGENTS.local.md`를
 주입한다. linked worktree는 primary worktree 하위에 두지 않는다. parent rule
 discovery가 primary bridge를 추가로 읽으면 중복 또는 누락 판단이 불가능해진다.
+Claude `--worktree` 기본값은 `.claude/worktrees/` 아래에 worktree를 만들기 때문에
+아래 `WorktreeCreate` hook을 설정해 primary 밖의 경로를 쓰거나, 수동으로
+`git worktree add ../<repo>-<name>`처럼 primary 밖에 만든 worktree에서 Claude를
+시작한다.
 
 bare repo + worktree 구성에서는 `git worktree list --porcelain -z`의 첫 `worktree`
 record가 bare metadata dir일 수 있다. 이때 local source는 checkout이 아니라 그
@@ -169,7 +173,7 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.local/bin/agents-overlay-context\" json SessionStart CLAUDE.md CLAUDE.local.md \"$CLAUDE_PROJECT_DIR\""
+            "command": "sh \"$HOME/.local/bin/agents-overlay-context\" json SessionStart CLAUDE.md CLAUDE.local.md . claude-session"
           }
         ]
       }
@@ -179,7 +183,17 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
         "hooks": [
           {
             "type": "command",
-            "command": "sh \"$HOME/.local/bin/agents-overlay-context\" json SubagentStart CLAUDE.md CLAUDE.local.md \"$CLAUDE_PROJECT_DIR\" claude-subagent"
+            "command": "sh \"$HOME/.local/bin/agents-overlay-context\" json SubagentStart CLAUDE.md CLAUDE.local.md . claude-subagent"
+          }
+        ]
+      }
+    ],
+    "WorktreeCreate": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$HOME/.local/bin/agents-overlay-context\" claude-worktree-create"
           }
         ]
       }
@@ -190,6 +204,8 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
 
 - `SessionStart`에 matcher를 두지 않는다. 새 세션과 resume 모두 같은 hook으로
   현재 rule을 확인한다.
+- Claude hook은 stdin JSON의 `cwd`를 active worktree로 사용한다.
+  `CLAUDE_PROJECT_DIR`는 source 판정 기준으로 쓰지 않는다.
 - Claude settings가 native bridge나 hook을 끄면 이 규약은 지원하지 않는다.
   아래 CLI flag와 settings key는 전제의 검증 기준 버전에서 확인한 이름이다.
   `claudeMdExcludes`가 `CLAUDE.md` / `CLAUDE.local.md`를 제외하지 않아야 하고,
@@ -201,10 +217,18 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
   로컬 규칙을 모두 주입한다.
 - `SubagentStart`에서 `agent_type=fork`는 부모 context를 상속하므로 주입하지
   않는다.
-- built-in `Explore`, `Plan`, 또는 hook 입력이 판정 불가인 경우에는 subagent
+- built-in `Explore`, `Plan`, 또는 `agent_type`이 판정 불가인 경우에는 subagent
   checkout 기준으로 공용·로컬 규칙을 모두 주입한다.
 - custom subagent 이름으로 `Explore`, `Plan`, `fork`를 쓰지 않는다. hook 입력만으로
   built-in/custom 출처를 구분할 수 없다.
+- `claude-worktree-create`는 Claude `--worktree` 기본 nested 배치를 primary 밖의
+  git worktree로 바꾼다. 기본 위치는
+  `$HOME/.cache/agents-local-overlay/claude-worktrees/<repo>-<hash>/<name>`이고,
+  `AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR`로 바꿀 수 있다. 기본 base ref는 `HEAD`이며
+  `AGENTS_OVERLAY_CLAUDE_WORKTREE_BASE_REF`로 명시 변경할 수 있다. branch 이름은
+  `agents-overlay/<name>`이다. 같은 target이나 branch가 이미 있으면 실패한다.
+  `WorktreeCreate` hook은 Claude 기본 git worktree 생성을 대체하므로
+  `.worktreeinclude`는 적용되지 않는다.
 
 ## Codex CLI
 
@@ -363,6 +387,8 @@ command -v trash >/dev/null 2>&1 && trash "$overlay_tmp_root" || printf 'remove 
   not loaded by overlay: ...` notice를 additional context로 넣고 overlay rule text는
   넣지 않는다. notice를 보면 보고된 파일을 regular UTF-8 rule/bridge 계약에 맞게
   고친 뒤 새 세션을 시작한다.
+- native rule로 전달된다고 판단한 파일도 UTF-8/NUL 검증을 통과해야 한다. 검증에
+  실패하면 hook은 native 전달로 보지 않고 notice를 넣는다.
 - Codex transcript format은 안정된 public contract가 아니다. major 업데이트 후에는
   resume, compact, subagent fork mode를 다시 검증한다.
 - local overlay는 repo당 하나다. worktree마다 서로 다른 `AGENTS.local.md`를 두는
