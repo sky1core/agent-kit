@@ -1196,6 +1196,44 @@ class OverlayContextTest(unittest.TestCase):
         self.assertIn("above Codex project_doc_max_bytes 100", body)
         self.assertNotIn("xxxxxxxxxxxxxxxx", body)
 
+    def test_codex_hook_json_cwd_drives_nested_project_config_chain(self):
+        repo, hook = self.codex_repo()
+        (repo / "AGENTS.md").write_text("x" * 1000 + "\n", encoding="utf-8")
+        sub = repo / "sub" / "inner"
+        config_dir = repo / "sub" / ".codex"
+        config_dir.mkdir(parents=True)
+        sub.mkdir()
+        (config_dir / "config.toml").write_text(
+            "project_doc_max_bytes = 100\n", encoding="utf-8"
+        )
+        hook = {**hook, "cwd": str(sub)}
+        env = self.codex_env(repo, max_bytes=32768)
+
+        proc = self.codex_session(repo, hook, env=env)
+
+        body = self.hook_body(proc)
+        self.assertIn("above Codex project_doc_max_bytes 100", body)
+        self.assertNotIn("xxxxxxxxxxxxxxxx", body)
+
+    def test_codex_malformed_hook_json_keeps_visible_dedupe_warning(self):
+        repo, _hook = self.codex_repo()
+
+        proc = self.overlay(
+            repo,
+            "json",
+            "SessionStart",
+            "AGENTS.md",
+            "-",
+            ".",
+            "codex-session",
+            stdin=b"{",
+            env=self.codex_env(repo),
+        )
+
+        body = self.hook_body(proc)
+        self.assertIn(CODEX_DEDUPE_WARNING, body)
+        self.assertIn("marker emerald-42", body)
+
     def test_codex_profile_config_lowered_max_bytes_drives_size_notice(self):
         repo, hook = self.codex_repo()
         (repo / "AGENTS.md").write_text("x" * 1000 + "\n", encoding="utf-8")
@@ -1225,6 +1263,52 @@ class OverlayContextTest(unittest.TestCase):
         body = self.hook_body(proc)
         self.assertIn("above Codex project_doc_max_bytes 100", body)
         self.assertNotIn("xxxxxxxxxxxxxxxx", body)
+
+    def test_codex_cli_override_projects_inline_table_drives_trust_notice(self):
+        repo, hook = self.codex_repo("repo.with.dot=eq")
+        env = self.codex_env(repo)
+        repo_key = json.dumps(os.path.realpath(str(repo)))
+        env["AGENTS_OVERLAY_CODEX_CONFIG_OVERRIDES"] = json.dumps(
+            [f'projects={{{repo_key}={{trust_level="untrusted"}}}}']
+        )
+
+        proc = self.codex_session(repo, hook, env=env)
+
+        body = self.hook_body(proc)
+        self.assertIn("project", body)
+        self.assertIn("is not trusted in Codex config", body)
+        self.assertNotIn("marker emerald-42", body)
+
+    def test_codex_cli_override_repeated_table_assignment_replaces_previous_override(self):
+        repo, hook = self.codex_repo()
+        env = self.codex_env(repo)
+        repo_key = json.dumps(os.path.realpath(str(repo)))
+        env["AGENTS_OVERLAY_CODEX_CONFIG_OVERRIDES"] = json.dumps(
+            [
+                f'projects={{{repo_key}={{trust_level="untrusted"}}}}',
+                "projects={}",
+            ]
+        )
+
+        proc = self.codex_session(repo, hook, env=env)
+
+        body = self.hook_body(proc)
+        self.assertNotIn("is not trusted in Codex config", body)
+        self.assertIn("marker emerald-42", body)
+
+    def test_codex_cli_override_quoted_dotted_key_does_not_override_project_trust(self):
+        repo, hook = self.codex_repo("repo.with.dot")
+        env = self.codex_env(repo)
+        repo_key = json.dumps(os.path.realpath(str(repo)))
+        env["AGENTS_OVERLAY_CODEX_CONFIG_OVERRIDES"] = json.dumps(
+            [f'projects.{repo_key}.trust_level="untrusted"']
+        )
+
+        proc = self.codex_session(repo, hook, env=env)
+
+        body = self.hook_body(proc)
+        self.assertNotIn("is not trusted in Codex config", body)
+        self.assertIn("marker emerald-42", body)
 
     def test_codex_hooks_feature_false_withholds_runtime_and_fails_verify(self):
         repo, hook = self.codex_repo()
@@ -2041,8 +2125,8 @@ class OverlayContextTest(unittest.TestCase):
         self.assertIn("--safe-mode disables hooks", proc.stderr.decode())
         self.assertFalse(marker.exists())
 
-    def codex_repo(self):
-        repo = self.init_repo()
+    def codex_repo(self, name="repo"):
+        repo = self.init_repo(name)
         transcript = repo / "session.jsonl"
         transcript.write_text("", encoding="utf-8")
         (repo / "AGENTS.md").write_text("# shared\ncodename bluebird\n", encoding="utf-8")

@@ -587,23 +587,43 @@ def parse_codex_config_value(value: str) -> Tuple[Any, str]:
         return value, ""
 
 
-def codex_override_data(override: str) -> Tuple[Dict[str, Any], str]:
-    if "=" not in override:
-        return {}, f"{CODEX_CONFIG_OVERRIDES_ENV} entry lacks key=value: {override}"
-    key, value_text = override.split("=", 1)
+def parse_codex_config_key(key: str) -> Tuple[List[str], str]:
     parts = [part.strip() for part in key.strip().split(".")]
     if not parts or any(not part for part in parts):
-        return {}, f"{CODEX_CONFIG_OVERRIDES_ENV} entry has an invalid dotted key: {override}"
+        return [], "invalid Codex config key segment"
+    return parts, ""
+
+
+def codex_override_parts_value(override: str) -> Tuple[List[str], Any, str]:
+    if "=" not in override:
+        return [], None, f"{CODEX_CONFIG_OVERRIDES_ENV} entry lacks key=value: {override}"
+    key, value_text = override.split("=", 1)
+    parts, key_problem = parse_codex_config_key(key)
+    if key_problem:
+        return [], None, f"{CODEX_CONFIG_OVERRIDES_ENV} entry has an invalid dotted key: {override}"
     value, problem = parse_codex_config_value(value_text.strip())
+    if problem:
+        return [], None, problem
+    return parts, value, ""
+
+
+def apply_codex_config_override(data: Dict[str, Any], parts: Sequence[str], value: Any) -> None:
+    current = data
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = value
+
+
+def codex_override_data(override: str) -> Tuple[Dict[str, Any], str]:
+    parts, value, problem = codex_override_parts_value(override)
     if problem:
         return {}, problem
     root: Dict[str, Any] = {}
-    current = root
-    for part in parts[:-1]:
-        child: Dict[str, Any] = {}
-        current[part] = child
-        current = child
-    current[parts[-1]] = value
+    apply_codex_config_override(root, parts, value)
     return root, ""
 
 
@@ -611,11 +631,11 @@ def codex_config_overrides_from_entries(entries: Sequence[str]) -> Tuple[Dict[st
     data: Dict[str, Any] = {}
     problems: List[str] = []
     for entry in entries:
-        layer, problem = codex_override_data(entry)
+        parts, value, problem = codex_override_parts_value(entry)
         if problem:
             problems.append(problem)
         else:
-            data = deep_merge_config(data, layer)
+            apply_codex_config_override(data, parts, value)
     return data, problems
 
 
@@ -1713,6 +1733,14 @@ def prepare_hook_args(argv: Sequence[str]) -> Tuple[str, str, str, str, str, str
                 shared_native = "-"
             if "local" not in setting_sources and local_native == CLAUDE_LOCAL_BRIDGE:
                 local_native = "-"
+    elif policy in ("codex-session", "codex-subagent"):
+        try:
+            codex_hook = parse_hook_object(hook_input, policy)
+        except OverlayError:
+            codex_hook = {}
+        cwd = codex_hook.get("cwd")
+        if isinstance(cwd, str) and cwd:
+            project_dir = cwd
     if policy == "claude-subagent":
         agent_type = hook.get("agent_type")
         if agent_type == "fork":
