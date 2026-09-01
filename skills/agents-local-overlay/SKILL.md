@@ -308,8 +308,12 @@ done
   넘으면 잘린 전문 대신 notice가 들어간다. rule 파일을 줄이거나, 세션마다
   필요하지 않은 내용은 일반 문서로 옮겨 명시적으로 열게 한다.
 - 로컬 overlay는 repo당 하나다. worktree마다 다른 `AGENTS.local.md`를 두는
-  구성은 지원하지 않으며, primary 밖 worktree의 독립 `AGENTS.local.md`는
-  `verify`가 실패로 보고한다.
+  구성은 지원하지 않는다. primary 밖 worktree의 독립 `AGENTS.local.md`는
+  primary source 존재 여부와 무관하게 `verify`가 실패로 보고하고, 그 worktree의
+  세션 hook도 notice를 낸다.
+- hook의 notice는 세션이 실행되는 worktree 기준으로만 판단한다(그 worktree의
+  `AGENTS.override.md`, `AGENTS.md` 부재·유효성, 독립 `AGENTS.local.md`).
+  다른 worktree까지 포함한 전체 검사는 `verify` 소관이다.
 - nested `CLAUDE.md`, 하위 디렉터리의 `AGENTS.md`는 각 CLI의 native 기능이고
   이 규약의 계약 밖이므로 검사하지 않는다.
 - wrapper나 Python core 실행 자체가 실패하면 hook 오류로 드러난다. Claude

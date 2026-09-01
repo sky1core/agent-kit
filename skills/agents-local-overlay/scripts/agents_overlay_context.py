@@ -419,6 +419,8 @@ def shared_source_path(ctx: RepoContext) -> Path:
 def overlay_opted_in(ctx: RepoContext) -> bool:
     if path_exists(local_source_path(ctx)):
         return True
+    if ctx.top != ctx.root and path_exists(ctx.top / LOCAL_RULE):
+        return True
     for worktree in ctx.copy_worktrees:
         copy = worktree / CLAUDE_LOCAL_BRIDGE
         if path_exists(copy):
@@ -557,6 +559,7 @@ def claude_session_notices(ctx: RepoContext) -> List[str]:
         )
     local_text = read_optional_rule(local_source_path(ctx), notices)
     notices.extend(missing_shared_notices(ctx))
+    notices.extend(stray_local_notices(ctx))
     if path_exists(shared_source_path(ctx)):
         read_optional_rule(shared_source_path(ctx), notices)
         try:
@@ -611,7 +614,7 @@ def claude_subagent_command(event: str, hook: dict) -> int:
     if agent_type == "fork":
         return 0
     ctx = resolve_context(hook_cwd(hook, "claude-subagent"))
-    notices: List[str] = list(missing_shared_notices(ctx))
+    notices: List[str] = missing_shared_notices(ctx) + stray_local_notices(ctx)
     parts: List[Tuple[str, str]] = []
     shared_text = read_optional_rule(shared_source_path(ctx), notices)
     if shared_text is not None:
@@ -634,14 +637,15 @@ def claude_subagent_command(event: str, hook: dict) -> int:
 
 def codex_precondition_notices(ctx: RepoContext) -> List[str]:
     notices: List[str] = []
-    for base in dict.fromkeys((ctx.top, ctx.root)):
-        override = base / CODEX_OVERRIDE
-        if path_exists(override):
-            notices.append(
-                f"Shared rules may be missing: {override} replaces {SHARED_RULE} "
-                "for Codex in that directory; remove it"
-            )
+    override = ctx.top / CODEX_OVERRIDE
+    if path_exists(override):
+        notices.append(
+            f"Shared rules may be missing: {override} replaces {SHARED_RULE} "
+            "for Codex in this worktree; remove it"
+        )
     notices.extend(missing_shared_notices(ctx))
+    notices.extend(invalid_shared_notices(ctx))
+    notices.extend(stray_local_notices(ctx))
     return notices
 
 
@@ -656,9 +660,35 @@ def missing_shared_notices(ctx: RepoContext) -> List[str]:
     return []
 
 
+def invalid_shared_notices(ctx: RepoContext) -> List[str]:
+    shared = ctx.top / SHARED_RULE
+    if not path_exists(shared):
+        return []
+    try:
+        read_rule(shared)
+    except OverlayError as exc:
+        return [f"Shared rules may be missing: {exc}"]
+    return []
+
+
+def stray_local_notices(ctx: RepoContext) -> List[str]:
+    if ctx.top == ctx.root:
+        return []
+    stray = ctx.top / LOCAL_RULE
+    if path_exists(stray):
+        return [
+            f"Rules not delivered: {stray} is not read; the local source lives "
+            f"in the primary worktree only — move its content to "
+            f"{local_source_path(ctx)}"
+        ]
+    return []
+
+
 def codex_hook_command(event: str, hook: dict, policy: str) -> int:
     ctx = resolve_context(hook_cwd(hook, policy))
     if not path_exists(local_source_path(ctx)):
+        if stray_local_notices(ctx):
+            emit_json(event, notice_lines(codex_precondition_notices(ctx)))
         return 0
     notices = codex_precondition_notices(ctx)
     local_text = read_optional_rule(local_source_path(ctx), notices)
@@ -1090,6 +1120,14 @@ def verify_command(argv: Sequence[str]) -> int:
             except OverlayError as exc:
                 problems.append(str(exc))
 
+    for worktree in ctx.copy_worktrees:
+        stray = worktree / LOCAL_RULE
+        if path_exists(stray):
+            problems.append(
+                f"{stray} exists but the local source lives in the primary "
+                f"worktree only; move its content to {local_source_path(ctx)}"
+            )
+
     if local_exists:
         if not ctx.root_is_bare:
             bridge = ctx.root / CLAUDE_LOCAL_BRIDGE
@@ -1105,12 +1143,6 @@ def verify_command(argv: Sequence[str]) -> int:
             except OverlayError as exc:
                 problems.append(str(exc))
         for worktree in ctx.copy_worktrees:
-            stray = worktree / LOCAL_RULE
-            if path_exists(stray):
-                problems.append(
-                    f"{stray} exists but the local source lives in the primary "
-                    f"worktree only; move its content to {local_source_path(ctx)}"
-                )
             copy = worktree / CLAUDE_LOCAL_BRIDGE
             try:
                 state = generated_copy_state(copy, local_text)

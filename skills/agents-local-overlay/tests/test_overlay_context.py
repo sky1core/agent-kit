@@ -421,6 +421,17 @@ class VerifyTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn(f"{steering} exists but is not overlay-generated", proc.stdout)
 
+    def test_fails_on_worktree_only_local_source(self) -> None:
+        repo = make_repo(self.base, local=False)
+        self.setup_repo(repo)
+        run_git(repo, "add", "CLAUDE.md", ".gitignore")
+        run_git(repo, "commit", "-qm", "bridge")
+        worktree = self.add_worktree(repo)
+        (worktree / "AGENTS.local.md").write_text("stranded local\n", encoding="utf-8")
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("local source lives in the primary worktree only", proc.stdout)
+
     def test_fails_on_stray_local_source_in_worktree(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
@@ -609,6 +620,45 @@ class CodexHookTests(OverlayTestCase):
         proc = run_core(CODEX_SUBAGENT, repo, stdin=hook_stdin(repo))
         self.assertIn("local rule Y", hook_context(proc))
 
+    def test_notices_worktree_only_local_source(self) -> None:
+        repo = make_repo(self.base, local=False)
+        worktree = self.add_worktree(repo)
+        (worktree / "AGENTS.local.md").write_text("stranded local\n", encoding="utf-8")
+        proc = run_core(CODEX_SESSION, worktree, stdin=hook_stdin(worktree))
+        context = hook_context(proc)
+        self.assertIn("is not read", context)
+        self.assertNotIn("stranded local", context)
+
+    def test_stray_local_notice_includes_broken_shared(self) -> None:
+        repo = make_repo(self.base, local=False)
+        worktree = self.add_worktree(repo)
+        (worktree / "AGENTS.local.md").write_text("stranded local\n", encoding="utf-8")
+        (worktree / "AGENTS.md").unlink()
+        (worktree / "AGENTS.md").symlink_to(repo / "AGENTS.md")
+        proc = run_core(CODEX_SESSION, worktree, stdin=hook_stdin(worktree))
+        context = hook_context(proc)
+        self.assertIn("is not read", context)
+        self.assertIn("is a symlink", context)
+        self.assertNotIn("stranded local", context)
+
+    def test_notice_on_invalid_shared_source(self) -> None:
+        repo = make_repo(self.base)
+        (repo / "AGENTS.md").unlink()
+        (repo / "AGENTS.md").symlink_to(repo / "AGENTS.local.md")
+        proc = run_core(CODEX_SESSION, repo, stdin=hook_stdin(repo))
+        context = hook_context(proc)
+        self.assertIn("is a symlink", context)
+        self.assertIn("local rule Y", context)
+
+    def test_no_override_notice_for_primary_only_override_in_linked(self) -> None:
+        repo = make_repo(self.base)
+        worktree = self.add_worktree(repo)
+        (repo / "AGENTS.override.md").write_text("override\n", encoding="utf-8")
+        proc = run_core(CODEX_SESSION, worktree, stdin=hook_stdin(worktree))
+        context = hook_context(proc)
+        self.assertNotIn("AGENTS.override.md", context)
+        self.assertIn("local rule Y", context)
+
     def test_worktree_uses_primary_local_source(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
@@ -694,6 +744,14 @@ class KiroBodyTests(OverlayTestCase):
         proc = run_core(["kiro-body", str(repo)], repo)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("AGENTS.override.md", proc.stderr)
+
+    def test_aborts_on_invalid_shared_source(self) -> None:
+        repo = make_repo(self.base)
+        (repo / "AGENTS.md").unlink()
+        (repo / "AGENTS.md").symlink_to(repo / "AGENTS.local.md")
+        proc = run_core(["kiro-body", str(repo)], repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("is a symlink", proc.stderr)
 
 
 class KiroLauncherTests(OverlayTestCase):
