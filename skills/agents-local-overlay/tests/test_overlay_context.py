@@ -265,6 +265,31 @@ class VerifyTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 0)
         self.assertIn("outside the live-verified window", proc.stdout)
 
+    def test_accepts_current_live_verified_cli_versions(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        current_bin = write_cli_bin(
+            self.base / "current-bin",
+            {
+                "claude": 'echo "2.1.252 (Claude Code)"',
+                "codex": "echo codex-cli 0.152.0",
+                "kiro-cli": (
+                    'if [ "$1" = "settings" ] && [ "$2" = "list" ]; then\n'
+                    '  printf \'%s\\n\' \'{"chat.disableInheritingDefaultResources": false}\'\n'
+                    "  exit 0\n"
+                    "fi\n"
+                    "echo 2.20.2"
+                ),
+            },
+        )
+        proc = run_core(
+            ["verify"],
+            repo,
+            extra_env={"PATH": f"{current_bin}:{os.environ['PATH']}"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("outside the live-verified window", proc.stdout)
+
     def codex_home_with(self, config: str) -> dict:
         home = self.base / "codex-home"
         home.mkdir(exist_ok=True)

@@ -69,9 +69,9 @@ KIRO_FALSE_REMEDIATION = (
 KIRO_VERIFY_REFUSAL = f"could not verify Kiro settings; {KIRO_FALSE_REMEDIATION}"
 
 CLI_VERSION_WINDOWS = {
-    "claude": ((2, 1, 232), (2, 1, 235)),
-    "codex": ((0, 147, 0), (0, 147, 0)),
-    "kiro-cli": ((2, 15, 1), (2, 15, 1)),
+    "claude": ((2, 1, 232), (2, 1, 252)),
+    "codex": ((0, 147, 0), (0, 152, 0)),
+    "kiro-cli": ((2, 15, 1), (2, 20, 2)),
 }
 
 

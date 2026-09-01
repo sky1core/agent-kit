@@ -32,9 +32,10 @@ context에 넣고, `verify`가 실패한다.
 ## 전제
 
 - `git` 2.36 이상과 `python3` 3.11 이상(`tomllib` 필요)이 필요하다.
-- live 검증 범위는 Claude Code 2.1.235, Codex CLI 0.147.0, Kiro CLI 2.15.1의
-  v3 engine이다. `verify`는 설치된 CLI의 `--version`이 이 윈도우 밖이거나 판정
-  불가면 WARN을 낸다. 새 버전에서 live canary를 통과하면 윈도우를 넓힌다.
+- live 검증 범위는 Claude Code 2.1.232..2.1.252, Codex CLI 0.147.0..0.152.0,
+  Kiro CLI 2.15.1..2.20.2의 v3 engine이다. `verify`는 설치된 CLI의 `--version`이
+  이 윈도우 밖이거나 판정 불가면 WARN을 낸다. 새 버전에서 live canary를 통과하면
+  윈도우를 넓힌다.
 - `AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`는 NUL이 없는
   UTF-8 regular file이어야 한다. rule/bridge 파일의 symlink는 읽지 않는다.
 - `AGENTS.override.md`는 쓰지 않는다. Codex가 같은 디렉터리의 `AGENTS.md`를
