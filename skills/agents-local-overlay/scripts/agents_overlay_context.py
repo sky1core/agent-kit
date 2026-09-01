@@ -13,7 +13,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 SHARED_RULE = "AGENTS.md"
@@ -29,6 +29,9 @@ DEFAULT_CLAUDE_MAX_CHARS = 10000
 DEFAULT_RAW_MAX_CHARS = 32768
 CODEX_PROJECT_DOC_MAX_BYTES = 32768
 CODEX_PROJECT_DOC_MAX_BYTES_ENV = "AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES"
+CODEX_PROFILE_ENV = "AGENTS_OVERLAY_CODEX_PROFILE"
+CODEX_CONFIG_OVERRIDES_ENV = "AGENTS_OVERLAY_CODEX_CONFIG_OVERRIDES"
+CODEX_REQUIREMENTS_PATHS_ENV = "AGENTS_OVERLAY_CODEX_REQUIREMENTS_PATHS"
 DEFAULT_SCAN_MAX_ENTRIES = 200000
 SCAN_MAX_ENTRIES_ENV = "AGENTS_OVERLAY_SCAN_MAX_ENTRIES"
 KIRO_INHERITANCE_SETTING = "chat.disableInheritingDefaultResources"
@@ -36,6 +39,9 @@ KIRO_VERIFY_REFUSAL = f"could not verify Kiro {KIRO_INHERITANCE_SETTING} setting
 KIRO_FALSE_REMEDIATION = f"run: kiro-cli settings {KIRO_INHERITANCE_SETTING} false"
 CLAUDE_MD_EXCLUDES_KEY = "claudeMdExcludes"
 CLAUDE_MD_EXCLUDES_REFUSAL = f"could not verify Claude settings {CLAUDE_MD_EXCLUDES_KEY}"
+CLAUDE_SETTING_SOURCES_ENV = "AGENTS_OVERLAY_CLAUDE_SETTING_SOURCES"
+CLAUDE_SETTINGS_JSON_ENV = "AGENTS_OVERLAY_CLAUDE_SETTINGS_JSON"
+CLAUDE_MANAGED_SETTINGS_PATHS_ENV = "AGENTS_OVERLAY_CLAUDE_MANAGED_SETTINGS_PATHS"
 CLAUDE_POLICIES = ("default", "claude-session", "claude-subagent")
 CLAUDE_HOOK_POLICIES = ("claude-session", "claude-subagent")
 CLAUDE_WORKTREE_DIR_ENV = "AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR"
@@ -90,6 +96,8 @@ def usage() -> str:
         [
             "usage:",
             "  agents-overlay-context <json|raw> <event> <shared-native> <local-native> [project-dir] [policy]",
+            "  agents-overlay-context claude [claude-args...]",
+            "  agents-overlay-context codex [codex-args...]",
             "  agents-overlay-context claude-worktree-create",
             "  agents-overlay-context setup [project-dir]",
             "  agents-overlay-context verify [project-dir]",
@@ -501,35 +509,17 @@ def claude_config_dir() -> Path:
 @dataclass(frozen=True)
 class CodexConfig:
     state: str
+    problems: Tuple[str, ...]
+    data: Dict[str, Any]
     trust_levels: Tuple[Tuple[str, str], ...]
     root_markers_present: bool
     fallback_filenames: Optional[object]
     project_doc_max_bytes: Optional[object]
 
 
-def load_codex_config() -> CodexConfig:
-    path = codex_home() / "config.toml"
-    if not path.is_file():
-        return CodexConfig(
-            state="missing",
-            trust_levels=(),
-            root_markers_present=False,
-            fallback_filenames=None,
-            project_doc_max_bytes=None,
-        )
-    try:
-        import tomllib
-    except ImportError:
-        state = "no-tomllib"
-        data = {}
-    else:
-        try:
-            with open(path, "rb") as config_file:
-                data = tomllib.load(config_file)
-            state = "ok"
-        except (OSError, ValueError, tomllib.TOMLDecodeError):
-            state = "unparseable"
-            data = {}
+def codex_config_from_data(
+    state: str, data: Dict[str, Any], problems: Sequence[str]
+) -> CodexConfig:
     trust_levels: List[Tuple[str, str]] = []
     projects = data.get("projects")
     if isinstance(projects, dict):
@@ -540,11 +530,188 @@ def load_codex_config() -> CodexConfig:
                     trust_levels.append((key, level))
     return CodexConfig(
         state=state,
+        problems=tuple(problems),
+        data=data,
         trust_levels=tuple(trust_levels),
         root_markers_present="project_root_markers" in data,
         fallback_filenames=data.get("project_doc_fallback_filenames"),
         project_doc_max_bytes=data.get("project_doc_max_bytes"),
     )
+
+
+def load_toml_file(path: Path, label: str) -> Tuple[Dict[str, Any], str]:
+    try:
+        import tomllib
+    except ImportError:
+        return {}, f"python3 tomllib is unavailable; python3 3.11+ is required to validate {label}"
+    try:
+        with open(path, "rb") as config_file:
+            data = tomllib.load(config_file)
+    except (OSError, ValueError, tomllib.TOMLDecodeError):
+        return {}, f"could not parse {label}; fix the TOML syntax"
+    return dict(data), ""
+
+
+def deep_merge_config(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(base)
+    for key, value in overlay.items():
+        existing = merged.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            merged[key] = deep_merge_config(existing, value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def parse_codex_config_value(value: str) -> Tuple[Any, str]:
+    try:
+        import tomllib
+    except ImportError:
+        tomllib = None
+    if tomllib is not None:
+        try:
+            return tomllib.loads(f"value = {value}")["value"], ""
+        except tomllib.TOMLDecodeError:
+            return value, ""
+    text = value.strip()
+    lowered = text.lower()
+    if lowered == "true":
+        return True, ""
+    if lowered == "false":
+        return False, ""
+    if re.fullmatch(r"[+-]?[0-9]+", text):
+        return int(text), ""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return value, ""
+
+
+def codex_override_data(override: str) -> Tuple[Dict[str, Any], str]:
+    if "=" not in override:
+        return {}, f"{CODEX_CONFIG_OVERRIDES_ENV} entry lacks key=value: {override}"
+    key, value_text = override.split("=", 1)
+    parts = [part.strip() for part in key.strip().split(".")]
+    if not parts or any(not part for part in parts):
+        return {}, f"{CODEX_CONFIG_OVERRIDES_ENV} entry has an invalid dotted key: {override}"
+    value, problem = parse_codex_config_value(value_text.strip())
+    if problem:
+        return {}, problem
+    root: Dict[str, Any] = {}
+    current = root
+    for part in parts[:-1]:
+        child: Dict[str, Any] = {}
+        current[part] = child
+        current = child
+    current[parts[-1]] = value
+    return root, ""
+
+
+def codex_config_overrides_from_entries(entries: Sequence[str]) -> Tuple[Dict[str, Any], List[str]]:
+    data: Dict[str, Any] = {}
+    problems: List[str] = []
+    for entry in entries:
+        layer, problem = codex_override_data(entry)
+        if problem:
+            problems.append(problem)
+        else:
+            data = deep_merge_config(data, layer)
+    return data, problems
+
+
+def codex_config_overrides_from_env() -> Tuple[Dict[str, Any], List[str]]:
+    raw = os.environ.get(CODEX_CONFIG_OVERRIDES_ENV)
+    if not raw:
+        return {}, []
+    try:
+        entries = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}, [f"{CODEX_CONFIG_OVERRIDES_ENV} must be a JSON array of key=value strings"]
+    if not isinstance(entries, list) or not all(isinstance(entry, str) for entry in entries):
+        return {}, [f"{CODEX_CONFIG_OVERRIDES_ENV} must be a JSON array of key=value strings"]
+    return codex_config_overrides_from_entries(entries)
+
+
+def codex_profile_path_from_env() -> Tuple[Optional[Path], str]:
+    profile = os.environ.get(CODEX_PROFILE_ENV)
+    if not profile:
+        return None, ""
+    if profile in (".", "..") or "/" in profile or "\\" in profile:
+        return None, f"{CODEX_PROFILE_ENV} must be a profile name, not a path"
+    return codex_home() / f"{profile}.config.toml", ""
+
+
+def codex_project_config_paths(ctx: RepoContext) -> List[Path]:
+    paths = [ctx.top / ".codex" / "config.toml"]
+    try:
+        rel = resolved_or_self(ctx.start).relative_to(resolved_or_self(ctx.top))
+    except ValueError:
+        return paths
+    current = ctx.top
+    for part in rel.parts:
+        current = current / part
+        paths.append(current / ".codex" / "config.toml")
+    return list(dict.fromkeys(paths))
+
+
+def codex_project_is_trusted(data: Dict[str, Any], top: Path) -> bool:
+    projects = data.get("projects")
+    if not isinstance(projects, dict):
+        return False
+    resolved_top = os.path.realpath(str(top))
+    for key, value in projects.items():
+        if (
+            isinstance(key, str)
+            and isinstance(value, dict)
+            and os.path.realpath(key) == resolved_top
+            and value.get("trust_level") == "trusted"
+        ):
+            return True
+    return False
+
+
+def load_codex_config(ctx: Optional[RepoContext] = None) -> CodexConfig:
+    path = codex_home() / "config.toml"
+    if not path.is_file():
+        return codex_config_from_data("missing", {}, [])
+
+    problems: List[str] = []
+    data, problem = load_toml_file(path, str(path))
+    if problem:
+        return codex_config_from_data("invalid", {}, [problem])
+
+    profile_path, profile_problem = codex_profile_path_from_env()
+    if profile_problem:
+        problems.append(profile_problem)
+    elif profile_path is not None:
+        if not profile_path.is_file():
+            problems.append(f"Codex profile config was not found: {profile_path}")
+        else:
+            profile_data, profile_load_problem = load_toml_file(profile_path, str(profile_path))
+            if profile_load_problem:
+                problems.append(profile_load_problem)
+            else:
+                data = deep_merge_config(data, profile_data)
+
+    override_data, override_problems = codex_config_overrides_from_env()
+    problems.extend(override_problems)
+    trust_data = deep_merge_config(data, override_data)
+
+    if ctx is not None and codex_project_is_trusted(trust_data, ctx.top):
+        for project_path in codex_project_config_paths(ctx):
+            if not path_exists(project_path):
+                continue
+            if not project_path.is_file():
+                problems.append(f"Codex project config is not a regular file: {project_path}")
+                continue
+            project_data, project_problem = load_toml_file(project_path, str(project_path))
+            if project_problem:
+                problems.append(project_problem)
+            else:
+                data = deep_merge_config(data, project_data)
+
+    data = deep_merge_config(data, override_data)
+    return codex_config_from_data("invalid" if problems else "ok", data, problems)
 
 
 def effective_codex_project_doc_max_bytes(cfg: CodexConfig) -> int:
@@ -559,7 +726,7 @@ def effective_codex_project_doc_max_bytes(cfg: CodexConfig) -> int:
         effective = config_value
     else:
         raise OverlayError(
-            f"{codex_home() / 'config.toml'} project_doc_max_bytes must be a positive integer"
+            "effective Codex config project_doc_max_bytes must be a positive integer"
         )
     env_value = os.environ.get(CODEX_PROJECT_DOC_MAX_BYTES_ENV)
     if not env_value:
@@ -573,31 +740,104 @@ def effective_codex_project_doc_max_bytes(cfg: CodexConfig) -> int:
     if parsed != effective:
         raise OverlayError(
             f"{CODEX_PROJECT_DOC_MAX_BYTES_ENV} is {parsed} but Codex config "
-            f"project_doc_max_bytes is {effective}; make them match or unset the env"
+            f"effective project_doc_max_bytes is {effective}; make them match or unset the env"
         )
     return effective
 
 
 def codex_config_refusals(cfg: CodexConfig) -> List[str]:
-    config_path = codex_home() / "config.toml"
-    if cfg.state == "no-tomllib":
-        return [
-            f"python3 tomllib is unavailable; python3 3.11+ is required to validate {config_path}"
-        ]
-    if cfg.state == "unparseable":
-        return [f"could not parse {config_path}; fix the TOML syntax"]
-    problems: List[str] = []
+    problems: List[str] = list(cfg.problems)
     if cfg.root_markers_present:
         problems.append(
-            f"{config_path} sets project_root_markers; remove that key, this overlay "
+            f"effective Codex config sets project_root_markers; remove that key, this overlay "
             "requires default Codex project root discovery"
         )
     if cfg.fallback_filenames is not None and cfg.fallback_filenames != []:
-        problems.append(f"{config_path} must set project_doc_fallback_filenames = []")
+        problems.append("effective Codex config must set project_doc_fallback_filenames = []")
+    problems.extend(codex_hooks_feature_refusals(cfg))
     try:
         effective_codex_project_doc_max_bytes(cfg)
     except OverlayError as exc:
         problems.append(str(exc))
+    return problems
+
+
+def codex_hooks_feature_refusals(cfg: CodexConfig) -> List[str]:
+    features = cfg.data.get("features")
+    if features is None:
+        return []
+    if not isinstance(features, dict):
+        return ["effective Codex config [features] must be a table"]
+    key = ""
+    value: Optional[object] = None
+    if "hooks" in features:
+        key = "features.hooks"
+        value = features.get("hooks")
+    elif "codex_hooks" in features:
+        key = "features.codex_hooks"
+        value = features.get("codex_hooks")
+    if not key:
+        return []
+    if isinstance(value, bool):
+        if value:
+            return []
+        return [f"effective Codex config sets {key} = false; Codex will not run this hook"]
+    return [f"effective Codex config {key} must be boolean"]
+
+
+def codex_default_requirements_paths() -> List[Path]:
+    if sys.platform == "win32":
+        program_data = os.environ.get("ProgramData") or os.path.join(
+            os.environ.get("SystemDrive", "C:"), "ProgramData"
+        )
+        return [Path(program_data) / "OpenAI" / "Codex" / "requirements.toml"]
+    return [Path("/etc/codex/requirements.toml")]
+
+
+def codex_requirements_paths() -> Tuple[List[Path], bool]:
+    raw = os.environ.get(CODEX_REQUIREMENTS_PATHS_ENV)
+    if raw is None:
+        return codex_default_requirements_paths(), False
+    if not raw:
+        return [], True
+    return [Path(part) for part in raw.split(os.pathsep) if part], True
+
+
+def codex_requirements_refusals() -> List[str]:
+    paths, explicit = codex_requirements_paths()
+    problems: List[str] = []
+    for path in paths:
+        if not path_exists(path):
+            if explicit:
+                problems.append(f"Codex requirements file was not found: {path}")
+            continue
+        if not path.is_file():
+            problems.append(f"Codex requirements path is not a regular file: {path}")
+            continue
+        data, problem = load_toml_file(path, str(path))
+        if problem:
+            problems.append(problem)
+            continue
+        allow_managed = data.get("allow_managed_hooks_only")
+        if isinstance(allow_managed, bool):
+            if allow_managed:
+                problems.append(
+                    f"{path} sets allow_managed_hooks_only = true; user Codex hooks will not run"
+                )
+        elif allow_managed is not None:
+            problems.append(f"{path} allow_managed_hooks_only must be boolean")
+        features = data.get("features")
+        if features is None:
+            continue
+        if not isinstance(features, dict):
+            problems.append(f"{path} [features] must be a table")
+            continue
+        hooks = features.get("hooks")
+        if isinstance(hooks, bool):
+            if not hooks:
+                problems.append(f"{path} sets features.hooks = false; Codex hooks will not run")
+        elif hooks is not None:
+            problems.append(f"{path} features.hooks must be boolean")
     return problems
 
 
@@ -635,13 +875,13 @@ def codex_chain_rule_findings(ctx: RepoContext) -> List[str]:
 
 
 def codex_runtime_precondition_refusals(ctx: RepoContext) -> List[str]:
-    cfg = load_codex_config()
+    cfg = load_codex_config(ctx)
     if cfg.state == "missing":
         return [
             f"Codex config {codex_home() / 'config.toml'} was not found; "
             "codex native rule loading cannot be confirmed"
         ]
-    refusals = codex_config_refusals(cfg)
+    refusals = codex_requirements_refusals() + codex_config_refusals(cfg)
     if refusals:
         return refusals
     trust = codex_trust_refusal(cfg, ctx.top)
@@ -651,10 +891,10 @@ def codex_runtime_precondition_refusals(ctx: RepoContext) -> List[str]:
 
 
 def codex_precondition_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
-    cfg = load_codex_config()
+    cfg = load_codex_config(ctx)
     if cfg.state == "missing":
         return [], []
-    problems = codex_config_refusals(cfg)
+    problems = codex_requirements_refusals() + codex_config_refusals(cfg)
     warnings: List[str] = []
     if not problems:
         trust = codex_trust_refusal(cfg, ctx.top)
@@ -833,34 +1073,127 @@ def kiro_inheritance_warnings(ctx: RepoContext) -> List[str]:
     return []
 
 
-def claude_settings_paths(ctx: RepoContext) -> Tuple[Path, ...]:
-    return (
-        claude_config_dir() / "settings.json",
-        ctx.top / ".claude" / "settings.json",
-        ctx.top / ".claude" / "settings.local.json",
-    )
+def parse_claude_setting_sources(raw: str) -> Tuple[Optional[Tuple[str, ...]], str]:
+    sources = tuple(part.strip() for part in raw.split(",") if part.strip())
+    allowed = {"user", "project", "local"}
+    if not sources or any(source not in allowed for source in sources):
+        return None, f"{CLAUDE_SETTING_SOURCES_ENV} must be a comma-separated subset of user,project,local"
+    return sources, ""
 
 
-def bridge_rel_candidates(ctx: RepoContext, name: str, path: Path) -> Tuple[str, ...]:
-    candidates = [name]
+def claude_setting_sources_from_env() -> Tuple[Optional[Tuple[str, ...]], str]:
+    raw = os.environ.get(CLAUDE_SETTING_SOURCES_ENV)
+    if raw is None:
+        return None, ""
+    return parse_claude_setting_sources(raw)
+
+
+def claude_file_settings_paths(ctx: RepoContext) -> Tuple[List[Tuple[str, Path]], str]:
+    sources, problem = claude_setting_sources_from_env()
+    if problem:
+        return [], problem
+    entries = [
+        ("user", claude_config_dir() / "settings.json"),
+        ("project", ctx.start / ".claude" / "settings.json"),
+        ("local", ctx.start / ".claude" / "settings.local.json"),
+    ]
+    if sources is None:
+        return entries, ""
+    included = set(sources)
+    return [entry for entry in entries if entry[0] in included], ""
+
+
+def claude_default_managed_settings_paths() -> List[Path]:
+    if sys.platform == "darwin":
+        base = Path("/Library/Application Support/ClaudeCode")
+    elif sys.platform == "win32":
+        program_files = os.environ.get("ProgramFiles") or os.path.join(
+            os.environ.get("SystemDrive", "C:"), "Program Files"
+        )
+        base = Path(program_files) / "ClaudeCode"
+    else:
+        base = Path("/etc/claude-code")
+    paths = [base / "managed-settings.json"]
+    dropin = base / "managed-settings.d"
     try:
-        candidates.append(str(path.relative_to(ctx.top)))
-    except ValueError:
+        paths.extend(sorted(dropin.glob("*.json")))
+    except OSError:
         pass
+    return paths
+
+
+def claude_managed_settings_paths() -> Tuple[List[Path], bool]:
+    raw = os.environ.get(CLAUDE_MANAGED_SETTINGS_PATHS_ENV)
+    if raw is None:
+        return claude_default_managed_settings_paths(), False
+    if not raw:
+        return [], True
+    return [Path(part) for part in raw.split(os.pathsep) if part], True
+
+
+def read_json_settings_file(path: Path, label: str) -> Tuple[Optional[dict], str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None, f"could not verify settings file {label}"
+    if not isinstance(data, dict):
+        return None, f"could not verify settings file {label}"
+    return data, ""
+
+
+def claude_settings_layers(ctx: RepoContext) -> Tuple[List[Tuple[str, dict]], List[str]]:
+    layers: List[Tuple[str, dict]] = []
+    problems: List[str] = []
+    file_paths, source_problem = claude_file_settings_paths(ctx)
+    if source_problem:
+        problems.append(source_problem)
+    for label, path in file_paths:
+        if not path_exists(path):
+            continue
+        data, problem = read_json_settings_file(path, str(path))
+        if problem:
+            problems.append(problem)
+        elif data is not None:
+            layers.append((label, data))
+    raw_cli_settings = os.environ.get(CLAUDE_SETTINGS_JSON_ENV)
+    if raw_cli_settings:
+        try:
+            parsed = json.loads(raw_cli_settings)
+        except json.JSONDecodeError:
+            problems.append(f"{CLAUDE_SETTINGS_JSON_ENV} must be a JSON object or array of objects")
+        else:
+            cli_layers = parsed if isinstance(parsed, list) else [parsed]
+            if not all(isinstance(layer, dict) for layer in cli_layers):
+                problems.append(f"{CLAUDE_SETTINGS_JSON_ENV} must be a JSON object or array of objects")
+            else:
+                layers.extend(("command line", layer) for layer in cli_layers)
+    managed_paths, explicit_managed_paths = claude_managed_settings_paths()
+    for path in managed_paths:
+        if not path_exists(path):
+            if explicit_managed_paths:
+                problems.append(f"Claude managed settings file was not found: {path}")
+            continue
+        if not path.is_file():
+            problems.append(f"Claude managed settings path is not a regular file: {path}")
+            continue
+        data, problem = read_json_settings_file(path, str(path))
+        if problem:
+            problems.append(problem)
+        elif data is not None:
+            layers.append(("managed", data))
+    return layers, problems
+
+
+def absolute_path_candidates(path: Path) -> Tuple[str, ...]:
+    candidates = []
+    for candidate in (path, resolved_or_self(path)):
+        candidate_path = candidate if candidate.is_absolute() else candidate.absolute()
+        candidates.append(str(candidate_path))
     return tuple(dict.fromkeys(candidates))
 
 
-def fnmatch_bridge(pattern: str, candidates: Tuple[str, ...]) -> bool:
-    if pattern in candidates:
-        return True
-    if any(fnmatch.fnmatch(candidate, pattern) for candidate in candidates):
-        return True
-    if pattern.startswith("**/"):
-        stripped = pattern[3:]
-        return stripped in candidates or any(
-            fnmatch.fnmatch(candidate, stripped) for candidate in candidates
-        )
-    return False
+def fnmatch_bridge_path(pattern: str, path: Path) -> bool:
+    return any(fnmatch.fnmatchcase(candidate, pattern) for candidate in absolute_path_candidates(path))
 
 
 def claude_excluded_bridge_name(ctx: RepoContext, patterns: Sequence[str]) -> str:
@@ -870,35 +1203,56 @@ def claude_excluded_bridge_name(ctx: RepoContext, patterns: Sequence[str]) -> st
     )
     for pattern in patterns:
         for name, path in bridges:
-            if fnmatch_bridge(pattern, bridge_rel_candidates(ctx, name, path)):
+            if fnmatch_bridge_path(pattern, path):
                 return name
     return ""
 
 
 def claude_bridge_exclusion_refusal(ctx: RepoContext) -> str:
-    for path in claude_settings_paths(ctx):
-        if not path_exists(path):
-            continue
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return CLAUDE_MD_EXCLUDES_REFUSAL
-        if not isinstance(data, dict):
-            return CLAUDE_MD_EXCLUDES_REFUSAL
+    layers, problems = claude_settings_layers(ctx)
+    if problems:
+        return CLAUDE_MD_EXCLUDES_REFUSAL
+    patterns: List[str] = []
+    for _label, data in layers:
         if CLAUDE_MD_EXCLUDES_KEY not in data:
             continue
-        patterns = data[CLAUDE_MD_EXCLUDES_KEY]
-        if not isinstance(patterns, list) or not all(
-            isinstance(pattern, str) for pattern in patterns
+        value = data[CLAUDE_MD_EXCLUDES_KEY]
+        if not isinstance(value, list) or not all(
+            isinstance(pattern, str) for pattern in value
         ):
             return CLAUDE_MD_EXCLUDES_REFUSAL
-        excluded = claude_excluded_bridge_name(ctx, patterns)
-        if excluded:
-            return (
-                f"Claude {CLAUDE_MD_EXCLUDES_KEY} excludes {excluded}; "
-                "remove that exclusion or set CLAUDE_CODE_DISABLE_CLAUDE_MDS=1"
-            )
+        patterns.extend(value)
+    excluded = claude_excluded_bridge_name(ctx, patterns)
+    if excluded:
+        return (
+            f"Claude {CLAUDE_MD_EXCLUDES_KEY} excludes {excluded}; "
+            "remove that exclusion or set CLAUDE_CODE_DISABLE_CLAUDE_MDS=1"
+        )
     return ""
+
+
+def claude_hook_disable_refusals(ctx: RepoContext) -> List[str]:
+    layers, problems = claude_settings_layers(ctx)
+    if problems:
+        return problems
+    disable_all: Optional[bool] = None
+    refusals: List[str] = []
+    for label, data in layers:
+        if "disableAllHooks" in data:
+            value = data["disableAllHooks"]
+            if not isinstance(value, bool):
+                refusals.append(f"Claude {label} settings disableAllHooks must be boolean")
+            else:
+                disable_all = value
+        if label == "managed" and data.get("allowManagedHooksOnly") is True:
+            refusals.append("Claude managed settings set allowManagedHooksOnly=true; user hooks will not run")
+        elif label == "managed" and "allowManagedHooksOnly" in data and not isinstance(
+            data.get("allowManagedHooksOnly"), bool
+        ):
+            refusals.append("Claude managed settings allowManagedHooksOnly must be boolean")
+    if disable_all:
+        refusals.append("Claude effective settings set disableAllHooks=true; this hook will not run")
+    return refusals
 
 
 def codex_override_refusal(ctx: RepoContext, policy: str) -> str:
@@ -920,7 +1274,7 @@ def codex_native_size_refusal(ctx: RepoContext, policy: str, shared_native: str)
         size = path.stat().st_size
     except OSError as exc:
         return f"could not inspect size for {path}: {exc}"
-    cfg = load_codex_config()
+    cfg = load_codex_config(ctx)
     if cfg.state != "ok":
         return ""
     try:
@@ -962,6 +1316,10 @@ def build_body(
         override_refusal = codex_override_refusal(ctx, policy)
         if override_refusal:
             return rule_error_notice(override_refusal) + "\n"
+        if policy in CLAUDE_HOOK_POLICIES:
+            hook_refusals = claude_hook_disable_refusals(ctx)
+            if hook_refusals:
+                return rules_withheld_notice("; ".join(hook_refusals)) + "\n"
         if (
             policy in CLAUDE_HOOK_POLICIES
             and (
@@ -1349,6 +1707,12 @@ def prepare_hook_args(argv: Sequence[str]) -> Tuple[str, str, str, str, str, str
     if policy in CLAUDE_HOOK_POLICIES:
         hook = parse_hook_object(hook_input, policy)
         project_dir = hook_cwd(hook, policy)
+        setting_sources, _setting_sources_problem = claude_setting_sources_from_env()
+        if setting_sources is not None:
+            if "project" not in setting_sources and shared_native == CLAUDE_SHARED_BRIDGE:
+                shared_native = "-"
+            if "local" not in setting_sources and local_native == CLAUDE_LOCAL_BRIDGE:
+                local_native = "-"
     if policy == "claude-subagent":
         agent_type = hook.get("agent_type")
         if agent_type == "fork":
@@ -1356,13 +1720,11 @@ def prepare_hook_args(argv: Sequence[str]) -> Tuple[str, str, str, str, str, str
         if agent_type in ("Explore", "Plan") or not isinstance(agent_type, str) or not agent_type:
             shared_native = "-"
             local_native = "-"
-    if (
-        os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1"
-        and shared_native == CLAUDE_SHARED_BRIDGE
-        and local_native == CLAUDE_LOCAL_BRIDGE
-    ):
-        shared_native = "-"
-        local_native = "-"
+    if os.environ.get("CLAUDE_CODE_DISABLE_CLAUDE_MDS") == "1":
+        if shared_native == CLAUDE_SHARED_BRIDGE:
+            shared_native = "-"
+        if local_native == CLAUDE_LOCAL_BRIDGE:
+            local_native = "-"
     return format_name, event, shared_native, local_native, project_dir, policy, hook_input
 
 
@@ -1709,7 +2071,7 @@ def rule_resolution_problems(ctx: RepoContext) -> List[str]:
 
 
 def codex_native_size_problems(ctx: RepoContext) -> List[str]:
-    cfg = load_codex_config()
+    cfg = load_codex_config(ctx)
     if cfg.state != "ok":
         return []
     path = ctx.top / SHARED_RULE
@@ -1916,6 +2278,7 @@ def verify_context(ctx: RepoContext) -> Tuple[List[str], List[str]]:
 
     problems.extend(rule_resolution_problems(ctx))
     problems.extend(codex_native_size_problems(ctx))
+    problems.extend(claude_hook_disable_refusals(ctx))
     claude_refusal = claude_bridge_exclusion_refusal(ctx)
     if claude_refusal:
         problems.append(claude_refusal)
@@ -1975,6 +2338,7 @@ def setup_context(ctx: RepoContext) -> int:
         problems.append(f"{ctx.top / 'AGENTS.override.md'} must not exist for this overlay")
     problems.extend(rule_resolution_problems(ctx))
     problems.extend(codex_native_size_problems(ctx))
+    problems.extend(claude_hook_disable_refusals(ctx))
     claude_refusal = claude_bridge_exclusion_refusal(ctx)
     if claude_refusal:
         problems.append(claude_refusal)
@@ -2028,6 +2392,152 @@ def setup_context(ctx: RepoContext) -> int:
     return 0
 
 
+def cli_arg_value(argv: Sequence[str], index: int, option: str) -> Tuple[str, int]:
+    if index + 1 >= len(argv):
+        raise OverlayError(f"{option} requires a value")
+    return argv[index + 1], index + 2
+
+
+def exec_cli_with_env(binary_name: str, argv: Sequence[str], updates: Dict[str, Optional[str]]) -> int:
+    binary = shutil.which(binary_name)
+    if not binary:
+        raise OverlayError(f"{binary_name} is required")
+    env = os.environ.copy()
+    for key, value in updates.items():
+        if value is None:
+            env.pop(key, None)
+        else:
+            env[key] = value
+    os.execvpe(binary, [binary, *argv], env)
+    return 1
+
+
+def codex_launcher_command(argv: Sequence[str]) -> int:
+    profile: Optional[str] = None
+    overrides: List[str] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg == "--ignore-user-config" or arg.startswith("--ignore-user-config="):
+            raise OverlayError("--ignore-user-config skips user Codex config; overlay hook cannot run")
+        if arg in ("-p", "--profile"):
+            profile, index = cli_arg_value(argv, index, arg)
+            continue
+        if arg.startswith("--profile="):
+            profile = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg in ("-c", "--config"):
+            value, index = cli_arg_value(argv, index, arg)
+            overrides.append(value)
+            continue
+        if arg.startswith("--config="):
+            overrides.append(arg.split("=", 1)[1])
+            index += 1
+            continue
+        if arg == "--enable":
+            feature, index = cli_arg_value(argv, index, arg)
+            overrides.append(f"features.{feature}=true")
+            continue
+        if arg.startswith("--enable="):
+            overrides.append(f"features.{arg.split('=', 1)[1]}=true")
+            index += 1
+            continue
+        if arg == "--disable":
+            feature, index = cli_arg_value(argv, index, arg)
+            overrides.append(f"features.{feature}=false")
+            continue
+        if arg.startswith("--disable="):
+            overrides.append(f"features.{arg.split('=', 1)[1]}=false")
+            index += 1
+            continue
+        index += 1
+    override_data, override_problems = codex_config_overrides_from_entries(overrides)
+    if override_problems:
+        raise OverlayError(override_problems[0])
+    override_refusals = codex_hooks_feature_refusals(
+        codex_config_from_data("cli overrides", override_data, [])
+    )
+    if override_refusals:
+        raise OverlayError(override_refusals[0])
+    return exec_cli_with_env(
+        "codex",
+        argv,
+        {
+            CODEX_PROFILE_ENV: profile,
+            CODEX_CONFIG_OVERRIDES_ENV: json.dumps(overrides) if overrides else None,
+        },
+    )
+
+
+def claude_settings_object(value: str) -> dict:
+    candidate = Path(value).expanduser()
+    if candidate.is_file():
+        data, problem = read_json_settings_file(candidate, str(candidate))
+        if problem or data is None:
+            raise OverlayError(problem or f"could not verify settings file {candidate}")
+        return data
+    try:
+        data = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise OverlayError(f"--settings must be a JSON object or a readable JSON file: {value}") from exc
+    if not isinstance(data, dict):
+        raise OverlayError("--settings must be a JSON object or a readable JSON file")
+    return data
+
+
+def claude_launcher_command(argv: Sequence[str]) -> int:
+    setting_sources: Optional[str] = None
+    settings_layers: List[dict] = []
+    index = 0
+    while index < len(argv):
+        arg = argv[index]
+        if arg == "--":
+            break
+        if arg in ("--bare", "--safe-mode"):
+            raise OverlayError(f"{arg} disables hooks or CLAUDE.md loading; overlay cannot run")
+        if arg == "--setting-sources":
+            setting_sources, index = cli_arg_value(argv, index, arg)
+            continue
+        if arg.startswith("--setting-sources="):
+            setting_sources = arg.split("=", 1)[1]
+            index += 1
+            continue
+        if arg == "--settings":
+            value, index = cli_arg_value(argv, index, arg)
+            settings_layers.append(claude_settings_object(value))
+            continue
+        if arg.startswith("--settings="):
+            settings_layers.append(claude_settings_object(arg.split("=", 1)[1]))
+            index += 1
+            continue
+        index += 1
+    if setting_sources is not None:
+        sources, problem = parse_claude_setting_sources(setting_sources)
+        if problem:
+            raise OverlayError(problem)
+        if sources is not None and "user" not in sources:
+            raise OverlayError("--setting-sources without user skips the user hook configuration")
+    for layer in settings_layers:
+        if "disableAllHooks" not in layer:
+            continue
+        value = layer["disableAllHooks"]
+        if not isinstance(value, bool):
+            raise OverlayError("--settings disableAllHooks must be boolean")
+        if value:
+            raise OverlayError("--settings disableAllHooks=true disables this hook before it can run")
+    return exec_cli_with_env(
+        "claude",
+        argv,
+        {
+            CLAUDE_SETTING_SOURCES_ENV: setting_sources,
+            CLAUDE_SETTINGS_JSON_ENV: json.dumps(settings_layers) if settings_layers else None,
+        },
+    )
+
+
 def setup_command(argv: Sequence[str]) -> int:
     project_dir = argv[0] if argv else "."
     ctx = resolve_context(project_dir, "setup", require_git=True)
@@ -2062,6 +2572,10 @@ def main(argv: Sequence[str]) -> int:
     try:
         if argv[0] in ("json", "raw"):
             return emit_command(argv)
+        if argv[0] == "claude":
+            return claude_launcher_command(argv[1:])
+        if argv[0] == "codex":
+            return codex_launcher_command(argv[1:])
         if argv[0] == "claude-worktree-create":
             return claude_worktree_create_command(argv[1:])
         if argv[0] == "setup":

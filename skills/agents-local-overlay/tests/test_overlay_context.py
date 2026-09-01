@@ -1159,6 +1159,102 @@ class OverlayContextTest(unittest.TestCase):
         self.assertNotEqual(env_mismatch.returncode, 0)
         self.assertIn("make them match or unset the env", env_mismatch.stdout.decode())
 
+    def test_codex_project_config_lowered_max_bytes_drives_size_notice(self):
+        repo, hook = self.codex_repo()
+        (repo / "AGENTS.md").write_text("x" * 1000 + "\n", encoding="utf-8")
+        config_dir = repo / ".codex"
+        config_dir.mkdir()
+        (config_dir / "config.toml").write_text(
+            "project_doc_max_bytes = 100\n", encoding="utf-8"
+        )
+        env = self.codex_env(repo, max_bytes=32768)
+
+        runtime = self.codex_session(repo, hook, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        body = self.hook_body(runtime)
+        self.assertIn("above Codex project_doc_max_bytes 100", body)
+        self.assertNotIn("xxxxxxxxxxxxxxxx", body)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn("above Codex project_doc_max_bytes 100", verify.stdout.decode())
+
+    def test_codex_nested_project_config_lowered_max_bytes_uses_session_cwd_chain(self):
+        repo, hook = self.codex_repo()
+        (repo / "AGENTS.md").write_text("x" * 1000 + "\n", encoding="utf-8")
+        sub = repo / "sub" / "inner"
+        config_dir = repo / "sub" / ".codex"
+        config_dir.mkdir(parents=True)
+        sub.mkdir()
+        (config_dir / "config.toml").write_text(
+            "project_doc_max_bytes = 100\n", encoding="utf-8"
+        )
+        env = self.codex_env(repo, max_bytes=32768)
+
+        proc = self.codex_session(repo, hook, env=env, project_dir=str(sub))
+
+        body = self.hook_body(proc)
+        self.assertIn("above Codex project_doc_max_bytes 100", body)
+        self.assertNotIn("xxxxxxxxxxxxxxxx", body)
+
+    def test_codex_profile_config_lowered_max_bytes_drives_size_notice(self):
+        repo, hook = self.codex_repo()
+        (repo / "AGENTS.md").write_text("x" * 1000 + "\n", encoding="utf-8")
+        env = self.codex_env(repo, max_bytes=32768)
+        home = Path(env["CODEX_HOME"])
+        (home / "small.config.toml").write_text(
+            "project_doc_max_bytes = 100\n", encoding="utf-8"
+        )
+        env["AGENTS_OVERLAY_CODEX_PROFILE"] = "small"
+
+        proc = self.codex_session(repo, hook, env=env)
+
+        body = self.hook_body(proc)
+        self.assertIn("above Codex project_doc_max_bytes 100", body)
+        self.assertNotIn("xxxxxxxxxxxxxxxx", body)
+
+    def test_codex_cli_override_lowered_max_bytes_drives_size_notice(self):
+        repo, hook = self.codex_repo()
+        (repo / "AGENTS.md").write_text("x" * 1000 + "\n", encoding="utf-8")
+        env = self.codex_env(repo, max_bytes=32768)
+        env["AGENTS_OVERLAY_CODEX_CONFIG_OVERRIDES"] = json.dumps(
+            ["project_doc_max_bytes=100"]
+        )
+
+        proc = self.codex_session(repo, hook, env=env)
+
+        body = self.hook_body(proc)
+        self.assertIn("above Codex project_doc_max_bytes 100", body)
+        self.assertNotIn("xxxxxxxxxxxxxxxx", body)
+
+    def test_codex_hooks_feature_false_withholds_runtime_and_fails_verify(self):
+        repo, hook = self.codex_repo()
+        env = self.codex_env(repo, extra="[features]\nhooks = false")
+
+        runtime = self.codex_session(repo, hook, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        body = self.hook_body(runtime)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("features.hooks = false", body)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn("features.hooks = false", verify.stdout.decode())
+
+    def test_codex_managed_hooks_only_requirement_fails_verify(self):
+        repo, hook = self.codex_repo()
+        requirements = self.root / "requirements.toml"
+        requirements.write_text("allow_managed_hooks_only = true\n", encoding="utf-8")
+        env = self.codex_env(repo)
+        env["AGENTS_OVERLAY_CODEX_REQUIREMENTS_PATHS"] = str(requirements)
+
+        runtime = self.codex_session(repo, hook, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        body = self.hook_body(runtime)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("allow_managed_hooks_only = true", body)
+        self.assertNotEqual(verify.returncode, 0)
+        self.assertIn("allow_managed_hooks_only = true", verify.stdout.decode())
+
     def test_verify_rejects_large_claude_full_injection_body(self):
         repo = self.init_repo()
         (repo / "AGENTS.md").write_text("s" * 30000 + "\n", encoding="utf-8")
@@ -1736,6 +1832,215 @@ class OverlayContextTest(unittest.TestCase):
 
         self.assertEqual(proc.returncode, 0, proc.stdout.decode() + proc.stderr.decode())
 
+    def test_codex_launcher_exports_profile_and_config_overrides(self):
+        repo = self.init_repo()
+        marker = self.root / "codex-launch-env"
+        env = self.cli_bin_env(
+            {
+                "codex": (
+                    'printf "%s\\n%s\\n" "$AGENTS_OVERLAY_CODEX_PROFILE" '
+                    '"$AGENTS_OVERLAY_CODEX_CONFIG_OVERRIDES" > "$OVERLAY_MARKER"'
+                )
+            }
+        )
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "codex",
+                "--profile",
+                "small",
+                "--config",
+                "project_doc_max_bytes=100",
+                "--enable",
+                "web_search",
+                "exec",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "small")
+        self.assertEqual(
+            json.loads(lines[1]),
+            ["project_doc_max_bytes=100", "features.web_search=true"],
+        )
+
+    def test_codex_launcher_rejects_disable_hooks_before_exec(self):
+        repo = self.init_repo()
+        marker = self.root / "codex-should-not-exec"
+        env = self.cli_bin_env({"codex": ': > "$OVERLAY_MARKER"'})
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "codex",
+                "--disable",
+                "hooks",
+                "exec",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("features.hooks = false", proc.stderr.decode())
+        self.assertFalse(marker.exists())
+
+    def test_codex_launcher_rejects_config_hooks_false_before_exec(self):
+        repo = self.init_repo()
+        marker = self.root / "codex-config-should-not-exec"
+        env = self.cli_bin_env({"codex": ': > "$OVERLAY_MARKER"'})
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "codex",
+                "--config",
+                "features.hooks=false",
+                "exec",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("features.hooks = false", proc.stderr.decode())
+        self.assertFalse(marker.exists())
+
+    def test_codex_launcher_rejects_ignore_user_config_before_exec(self):
+        repo = self.init_repo()
+        marker = self.root / "codex-ignore-user-config-should-not-exec"
+        env = self.cli_bin_env({"codex": ': > "$OVERLAY_MARKER"'})
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "codex",
+                "exec",
+                "--ignore-user-config",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--ignore-user-config skips user Codex config", proc.stderr.decode())
+        self.assertFalse(marker.exists())
+
+    def test_claude_launcher_exports_settings_sources_and_settings_json(self):
+        repo = self.init_repo()
+        marker = self.root / "claude-launch-env"
+        env = self.cli_bin_env(
+            {
+                "claude": (
+                    'printf "%s\\n%s\\n" "$AGENTS_OVERLAY_CLAUDE_SETTING_SOURCES" '
+                    '"$AGENTS_OVERLAY_CLAUDE_SETTINGS_JSON" > "$OVERLAY_MARKER"'
+                )
+            }
+        )
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "claude",
+                "--setting-sources",
+                "user,project",
+                "--settings",
+                '{"disableAllHooks": false}',
+                "-p",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertEqual(proc.returncode, 0, proc.stderr.decode())
+        lines = marker.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "user,project")
+        self.assertEqual(json.loads(lines[1]), [{"disableAllHooks": False}])
+
+    def test_claude_launcher_rejects_setting_sources_without_user_before_exec(self):
+        repo = self.init_repo()
+        marker = self.root / "claude-setting-sources-should-not-exec"
+        env = self.cli_bin_env({"claude": ': > "$OVERLAY_MARKER"'})
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "claude",
+                "--setting-sources",
+                "project,local",
+                "-p",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--setting-sources without user", proc.stderr.decode())
+        self.assertFalse(marker.exists())
+
+    def test_claude_launcher_rejects_disable_all_hooks_before_exec(self):
+        repo = self.init_repo()
+        marker = self.root / "claude-disable-hooks-should-not-exec"
+        env = self.cli_bin_env({"claude": ': > "$OVERLAY_MARKER"'})
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [
+                SCRIPT_DIR / "agents-overlay-context",
+                "claude",
+                "--settings",
+                '{"disableAllHooks": true}',
+                "-p",
+                "q",
+            ],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("disableAllHooks=true disables this hook", proc.stderr.decode())
+        self.assertFalse(marker.exists())
+
+    def test_claude_launcher_rejects_safe_mode_before_exec(self):
+        repo = self.init_repo()
+        marker = self.root / "claude-should-not-exec"
+        env = self.cli_bin_env({"claude": ': > "$OVERLAY_MARKER"'})
+        env["OVERLAY_MARKER"] = str(marker)
+
+        proc = run(
+            [SCRIPT_DIR / "agents-overlay-context", "claude", "--safe-mode", "-p", "q"],
+            repo,
+            env=env,
+            check=False,
+        )
+
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("--safe-mode disables hooks", proc.stderr.decode())
+        self.assertFalse(marker.exists())
+
     def codex_repo(self):
         repo = self.init_repo()
         transcript = repo / "session.jsonl"
@@ -1792,7 +2097,7 @@ class OverlayContextTest(unittest.TestCase):
         (repo / "CLAUDE.local.md").write_text("@AGENTS.local.md\n", encoding="utf-8")
         return repo
 
-    def claude_session(self, repo, env=None):
+    def claude_session(self, repo, env=None, cwd=None):
         return self.overlay(
             repo,
             "json",
@@ -1801,7 +2106,7 @@ class OverlayContextTest(unittest.TestCase):
             "CLAUDE.local.md",
             ".",
             "claude-session",
-            stdin=json.dumps({"cwd": str(repo)}).encode(),
+            stdin=json.dumps({"cwd": str(cwd or repo)}).encode(),
             env=env,
         )
 
@@ -1817,7 +2122,9 @@ class OverlayContextTest(unittest.TestCase):
 
     def test_claude_user_excluding_shared_bridge_withholds_runtime_rules(self):
         repo = self.claude_bridge_repo()
-        env = self.claude_config_env('{"claudeMdExcludes": ["CLAUDE.md"]}')
+        env = self.claude_config_env(
+            json.dumps({"claudeMdExcludes": [str((repo / "CLAUDE.md").resolve())]})
+        )
 
         proc = self.claude_session(repo, env=env)
 
@@ -1827,10 +2134,80 @@ class OverlayContextTest(unittest.TestCase):
         self.assertNotIn("codename bluebird", body)
         self.assertNotIn("marker emerald-42", body)
 
+    def test_claude_basename_exclude_does_not_match_absolute_bridge_path(self):
+        repo = self.claude_bridge_repo()
+        env = self.claude_config_env('{"claudeMdExcludes": ["CLAUDE.md"]}')
+
+        runtime = self.claude_session(repo, env=env)
+        verify = self.overlay(repo, "verify", env=env)
+
+        self.assertEqual(runtime.returncode, 0, runtime.stderr.decode())
+        self.assertEqual(runtime.stdout, b"")
+        self.assertEqual(verify.returncode, 0, verify.stdout.decode() + verify.stderr.decode())
+
+    def test_claude_active_cwd_project_settings_are_checked(self):
+        repo = self.claude_bridge_repo()
+        sub = repo / "pkg"
+        settings_dir = sub / ".claude"
+        settings_dir.mkdir(parents=True)
+        (settings_dir / "settings.json").write_text(
+            json.dumps({"claudeMdExcludes": [str((repo / "CLAUDE.md").resolve())]}),
+            encoding="utf-8",
+        )
+
+        proc = self.claude_session(repo, cwd=sub)
+
+        body = self.hook_body(proc)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("Claude claudeMdExcludes excludes CLAUDE.md", body)
+        self.assertNotIn("codename bluebird", body)
+        self.assertNotIn("marker emerald-42", body)
+
+    def test_claude_setting_sources_without_local_injects_local_rule(self):
+        repo = self.claude_bridge_repo()
+
+        proc = self.claude_session(
+            repo, env={"AGENTS_OVERLAY_CLAUDE_SETTING_SOURCES": "user,project"}
+        )
+
+        body = self.hook_body(proc)
+        self.assertNotIn("codename bluebird", body)
+        self.assertIn("marker emerald-42", body)
+
+    def test_claude_disable_claude_mds_after_setting_sources_injects_both_rules(self):
+        repo = self.claude_bridge_repo()
+
+        proc = self.claude_session(
+            repo,
+            env={
+                "AGENTS_OVERLAY_CLAUDE_SETTING_SOURCES": "user,project",
+                "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+            },
+        )
+
+        body = self.hook_body(proc)
+        self.assertIn("codename bluebird", body)
+        self.assertIn("marker emerald-42", body)
+
+    def test_claude_invalid_setting_sources_withholds_runtime_rules(self):
+        repo = self.claude_bridge_repo()
+
+        proc = self.claude_session(
+            repo, env={"AGENTS_OVERLAY_CLAUDE_SETTING_SOURCES": "user,unknown"}
+        )
+
+        body = self.hook_body(proc)
+        self.assertIn("Rules not injected", body)
+        self.assertIn("AGENTS_OVERLAY_CLAUDE_SETTING_SOURCES", body)
+        self.assertNotIn("codename bluebird", body)
+        self.assertNotIn("marker emerald-42", body)
+
     def test_claude_project_excluding_local_bridge_withholds_runtime_and_fails_verify(self):
         repo = self.claude_bridge_repo()
         self.write_project_claude_settings(
-            repo, "settings.json", '{"claudeMdExcludes": ["**/CLAUDE.local.md"]}'
+            repo,
+            "settings.json",
+            json.dumps({"claudeMdExcludes": [str((repo / "CLAUDE.local.md").resolve())]}),
         )
 
         runtime = self.claude_session(repo)
@@ -1881,11 +2258,11 @@ class OverlayContextTest(unittest.TestCase):
 
         body = self.hook_body(runtime)
         self.assertIn("Rules not injected", body)
-        self.assertIn("could not verify Claude settings claudeMdExcludes", body)
+        self.assertIn("could not verify settings file", body)
         self.assertNotIn("codename bluebird", body)
         self.assertNotIn("marker emerald-42", body)
         self.assertNotEqual(verify.returncode, 0)
-        self.assertIn("could not verify Claude settings claudeMdExcludes", verify.stdout.decode())
+        self.assertIn("could not verify settings file", verify.stdout.decode())
 
     def test_claude_disable_mds_ignores_excludes_and_full_injects(self):
         repo = self.claude_bridge_repo()

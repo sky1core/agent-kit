@@ -218,14 +218,20 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
   현재 rule을 확인한다.
 - Claude hook은 stdin JSON의 `cwd`를 active worktree로 사용한다.
   `CLAUDE_PROJECT_DIR`는 source 판정 기준으로 쓰지 않는다.
-- hook과 `verify`는 `$CLAUDE_CONFIG_DIR/settings.json`과 project
-  `.claude/settings.json` / `.claude/settings.local.json`을 읽어
-  `claudeMdExcludes`를 확인한다. `claudeMdExcludes`가 `CLAUDE.md` /
-  `CLAUDE.local.md` bridge를 제외하거나 settings를 JSON object로 검증할 수 없으면
+- hook과 `verify`는 user settings, hook JSON `cwd` 기준 project/local settings,
+  접근 가능한 file-based managed settings, wrapper가 전달한 one-session settings를
+  읽어 bridge와 hook 전제조건을 확인한다. `claudeMdExcludes`는 bridge 파일의
+  정규화된 절대경로와 비교한다. bridge가 제외됐거나 settings를 검증할 수 없으면
   runtime은 `Rules not injected` notice만 내고, `verify`는 FAIL한다.
-- CLI `--setting-sources` 또는 SDK `settingSources`에서 `project` / `local`을 빼는
-  상태, `--bare`, `--safe-mode`, `disableAllHooks=true`, managed settings의
-  `allowManagedHooksOnly=true`는 hook이 관찰할 수 없으므로 overlay 검증 경계 밖이다.
+- `--settings`, `--setting-sources`를 쓰는 Claude 세션은
+  `agents-overlay-context claude ...`로 시작한다. wrapper는 one-session settings를
+  hook 환경으로 전달하고, `--bare`, `--safe-mode`, user를 제외한
+  `--setting-sources`, `disableAllHooks=true` 설정은 실행 전에 실패한다.
+- raw `claude --settings ...` / `claude --setting-sources ...`처럼 wrapper를 우회한
+  one-session override, SDK `settingSources`, server/MDM/host-managed settings처럼
+  hook 프로세스가 관찰할 수 없는 설정은 이 규약의 exact-once 검증 대상이 아니다.
+  접근 가능한 settings에서 `disableAllHooks=true` 또는 managed
+  `allowManagedHooksOnly=true`가 보이면 `verify`는 FAIL한다.
 - `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`이면 bridge가 꺼진 것이므로 hook이 공용과
   로컬 규칙을 모두 주입한다.
 - `SubagentStart`에서 `agent_type=fork`는 부모 context를 상속하므로 주입하지
@@ -246,8 +252,7 @@ cmp -s "<skill-dir>/scripts/kiro_cli_overlay.py" "$HOME/.local/bin/kiro_cli_over
 ## Codex CLI
 
 `~/.codex/config.toml`에 추가한다(`CODEX_HOME`이 설정돼 있으면 그 아래
-`config.toml`이며, hook과 `verify`도 같은 위치를 읽는다). 같은 key가 이미 있으면
-중복 key를 만들지 말고 기존 값을 조정한다.
+`config.toml`). 같은 key가 이미 있으면 중복 key를 만들지 말고 기존 값을 조정한다.
 
 ```toml
 project_doc_max_bytes = 32768
@@ -274,35 +279,38 @@ additionalContextLimit = 0
   hook command 인자의 `-`는 해당 native source가 없으므로 hook이 필요한 규칙을 직접
   주입해야 한다는 뜻이다.
 - repo가 Codex에서 trusted여야 한다. trust는 project root 경로 단위이므로 linked
-  worktree를 쓰면 각 worktree 경로를 각각 trust한다. 현재 worktree top이
-  `config.toml`의 `[projects."<path>"] trust_level = "trusted"`와 일치하지 않으면
-  (항목 없음, untrusted, config 파일 없음, 파싱 불가 포함) hook은 공용·로컬 rule을
-  모두 주입하지 않고 notice만 낸다. Codex 0.150 미만에서는 untrusted repo라도
-  공용 `AGENTS.md`가 native로 로드되지만, hook은 같은 기준으로 로컬 rule을 빼고
-  notice를 내므로 누락이 조용히 지나가지는 않는다.
-- config에 `project_root_markers` key를 두지 않는다. 이 key가 있으면 Codex의
-  project root 판정이 이 규약의 전제와 달라질 수 있으므로 hook은 rule을 주입하지
-  않고 `verify`가 실패한다.
+  worktree를 쓰면 각 worktree 경로를 각각 trust한다. hook과 `verify`는 user config,
+  wrapper가 전달한 profile, trusted project config(root부터 hook cwd까지), wrapper가
+  전달한 `--config` override를 병합한 effective config로 trust와 native loading
+  전제를 판단한다. 현재 worktree top이 effective config의
+  `[projects."<path>"] trust_level = "trusted"`와 일치하지 않으면 hook은 공용·로컬
+  rule을 모두 주입하지 않고 notice만 낸다.
+- effective config에 `project_root_markers` key를 두지 않는다. 이 key가 있으면
+  Codex의 project root 판정이 이 규약의 전제와 달라질 수 있으므로 hook은 rule을
+  주입하지 않고 `verify`가 실패한다.
 - worktree top 밖 하위 디렉터리에 `AGENTS.md`나 `AGENTS.override.md`를 두지
   않는다. top에서 세션 cwd까지의 경로에서 발견되면 Codex native context에 계약 밖
   파일이 섞이므로 hook은 rule을 주입하지 않고 notice만 낸다. `verify`와 `setup`은
   worktree 전체를 스캔해 top 밖의 해당 파일 이름을 실패로 보고한다.
-- Codex가 네이티브로 읽는 `AGENTS.md`는 `project_doc_max_bytes` 이하여야 한다.
-  기준값은 config의 실제 값이고, key가 없으면 기본 32768 bytes다. 넘으면 hook이
-  잘린 prefix와 remainder를 분리해 복구할 수 없으므로 runtime notice를 내고
+- Codex가 네이티브로 읽는 `AGENTS.md`는 effective config의
+  `project_doc_max_bytes` 이하여야 한다. key가 없으면 기본 32768 bytes다. 넘으면
+  hook이 잘린 prefix와 remainder를 분리해 복구할 수 없으므로 runtime notice를 내고
   `verify`가 실패한다.
 - `AGENTS_OVERLAY_CODEX_PROJECT_DOC_MAX_BYTES`는 한도를 올리는 수단이 아니라
-  config 값과의 교차확인이다. 설정돼 있으면 config의 `project_doc_max_bytes`
-  유효값과 정확히 같아야 하고, 다르면 hook은 rule을 주입하지 않고 `verify`가
-  실패한다. 이전 버전에서 이 env로 기준을 올려 쓰고 있었다면 config 값을 올린 뒤
-  env를 지우거나 같은 값으로 맞춘다.
-- v1에서 큰 hook context를 쓰고 있었다면 아래 runtime cap 기준에 맞게
-  `AGENTS.md` / `AGENTS.local.md`를 줄인 뒤 업그레이드한다. 이 버전은 전문을 잘라
-  넣지 않고 cap 초과 notice로 실패를 드러낸다.
+  effective `project_doc_max_bytes`와의 교차확인이다. 다르면 hook은 rule을 주입하지
+  않고 `verify`가 실패한다.
 - `project_doc_fallback_filenames`는 `[]`로 두거나 key를 생략한다(문서화된 기본값
   `[]`). 다른 값이 있으면 fallback 파일이 `AGENTS.md` 자리를 대체해 중복·누락
   판정이 불가능해지므로 hook은 rule을 주입하지 않고 `verify`가 실패한다. 특히
   `AGENTS.local.md`를 넣지 않는다.
+- `--profile`, `--config`, `--enable`, `--disable`로 effective config를 바꾸는 Codex
+  세션은 `agents-overlay-context codex ...`로 시작한다. wrapper는
+  `--ignore-user-config`, `--disable hooks`, `--config features.hooks=false`를 실행 전에
+  실패시킨다. raw `codex --profile ...` / `codex --config ...`처럼 wrapper를 우회한
+  one-session override는 hook이 관찰할 수 없으므로 exact-once 검증 대상이 아니다.
+- effective config나 접근 가능한 `requirements.toml`에서 `[features].hooks = false`
+  또는 `allow_managed_hooks_only = true`가 보이면 `verify`가 실패한다. managed hooks
+  only 환경은 이 user hook 설치 방식으로는 지원하지 않는다.
 - `additionalContextLimit = 0`을 쓰되 runtime core가 자체 cap을 건다. 기본 cap은
   Claude 10000자, Codex 32768자, raw/Kiro 32768자다. 필요하면
   `AGENTS_OVERLAY_MAX_CHARS`로 Codex/raw/Kiro cap을 명시적으로 올린다. Claude cap은
