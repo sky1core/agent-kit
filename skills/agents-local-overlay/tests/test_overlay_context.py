@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -209,6 +210,15 @@ class SetupTests(OverlayTestCase):
         self.assertIn("removed orphan generated copy", proc.stdout)
         self.assertFalse((worktree / "CLAUDE.local.md").exists())
 
+    def test_preserves_gitignore_mode(self) -> None:
+        repo = make_repo(self.base)
+        gitignore = repo / ".gitignore"
+        gitignore.write_text("*.tmp\n", encoding="utf-8")
+        gitignore.chmod(0o600)
+        self.setup_repo(repo)
+        self.assertEqual(gitignore.stat().st_mode & 0o777, 0o600)
+        self.assertIn("AGENTS.local.md", gitignore.read_text(encoding="utf-8"))
+
     def test_second_run_changes_nothing(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
@@ -260,6 +270,19 @@ class VerifyTests(OverlayTestCase):
         d.mkdir(exist_ok=True)
         name = "settings.local.json" if local else "settings.json"
         (d / name).write_text(json.dumps(data), encoding="utf-8")
+
+    def test_fails_on_missing_registered_worktree(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        run_git(repo, "add", "CLAUDE.md", ".gitignore")
+        run_git(repo, "commit", "-qm", "bridge")
+        worktree = self.add_worktree(repo)
+        self.setup_repo(worktree)
+        shutil.rmtree(worktree)
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("registered as a worktree but does not exist", proc.stdout + proc.stderr)
+        self.assertNotIn("git is required", proc.stdout + proc.stderr)
 
     def test_fails_on_disable_all_hooks(self) -> None:
         repo = make_repo(self.base)
@@ -650,6 +673,49 @@ class ClaudeSessionHookTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse((worktree / "CLAUDE.local.md").exists())
 
+    def test_keeps_generated_copy_when_source_is_unreadable(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        run_git(repo, "add", "CLAUDE.md", ".gitignore")
+        run_git(repo, "commit", "-qm", "bridge")
+        worktree = self.add_worktree(repo)
+        self.setup_repo(worktree)
+        (repo / "AGENTS.local.md").unlink()
+        (repo / "AGENTS.local.md").symlink_to(repo / "AGENTS.md")
+        proc = run_core(CLAUDE_SESSION, worktree, stdin=hook_stdin(worktree))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("symlink", hook_context(proc))
+        copy = worktree / "CLAUDE.local.md"
+        self.assertTrue(copy.exists())
+        self.assertIn("local rule Y", copy.read_text(encoding="utf-8"))
+
+    def test_notice_when_worktree_is_moved_without_git(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        run_git(repo, "add", "CLAUDE.md", ".gitignore")
+        run_git(repo, "commit", "-qm", "bridge")
+        worktree = self.add_worktree(repo)
+        self.setup_repo(worktree)
+        moved = self.base / "moved"
+        shutil.move(str(worktree), str(moved))
+        proc = run_core(CLAUDE_SESSION, moved, stdin=hook_stdin(moved))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        context = hook_context(proc)
+        self.assertIn("not in git worktree list", context)
+        self.assertIn("git worktree repair", context)
+
+    def test_notice_when_worktree_nests_inside_primary(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        run_git(repo, "add", "CLAUDE.md", ".gitignore")
+        run_git(repo, "commit", "-qm", "bridge")
+        nested = repo / "nested"
+        run_git(repo, "worktree", "add", "-q", str(nested))
+        proc = run_core(CLAUDE_SESSION, nested, stdin=hook_stdin(nested))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Rules may be duplicated", hook_context(proc))
+        self.assertIn("nests with worktree", hook_context(proc))
+
     def test_notice_when_native_channel_disabled(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
@@ -1005,52 +1071,296 @@ class KiroLauncherTests(OverlayTestCase):
         self.assertIn("tracked", proc.stderr)
 
 
-class WorktreeCreateTests(OverlayTestCase):
+def git_stdout(cwd: Path, *args: str) -> str:
+    proc = subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        capture_output=True,
+        text=True,
+        env=isolated_env(),
+    )
+    return proc.stdout
+
+
+class WorktreeHookTestCase(OverlayTestCase):
+    def setUp(self) -> None:
+        super().setUp()
+        self.home = self.base / "home"
+        self.home.mkdir()
+
+    def create_worktree(self, repo: Path, name: str) -> subprocess.CompletedProcess:
+        return run_core(
+            ["claude-worktree-create"],
+            repo,
+            stdin=hook_stdin(repo, name=name),
+            extra_env={"HOME": str(self.home)},
+        )
+
+    def remove_worktree(self, repo: Path, target: Path) -> subprocess.CompletedProcess:
+        return run_core(
+            ["claude-worktree-remove"],
+            repo,
+            stdin=hook_stdin(repo, worktree_path=str(target)),
+            extra_env={"HOME": str(self.home)},
+        )
+
+    def worktree_count(self, repo: Path) -> int:
+        return git_stdout(repo, "worktree", "list", "--porcelain").count("worktree ")
+
+    def branch_exists(self, repo: Path, branch: str) -> bool:
+        return bool(git_stdout(repo, "branch", "--list", branch).strip())
+
+
+class WorktreeCreateTests(WorktreeHookTestCase):
     def test_creates_worktree_with_generated_copy(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
-        home = self.base / "home"
-        home.mkdir()
-        proc = run_core(
-            ["claude-worktree-create"],
-            repo,
-            stdin=hook_stdin(repo, name="feat1"),
-            extra_env={"HOME": str(home)},
-        )
+        proc = self.create_worktree(repo, "feat1")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         target = Path(proc.stdout.strip())
         self.assertTrue(target.is_dir())
-        self.assertTrue(str(target).startswith(str(home)))
+        self.assertTrue(str(target).startswith(str(self.home)))
         copy = target / "CLAUDE.local.md"
         self.assertTrue(copy.exists())
         self.assertIn("local rule Y", copy.read_text(encoding="utf-8"))
+
+    def test_generated_copy_is_ignored_even_without_committed_gitignore(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        proc = self.create_worktree(repo, "feat1")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        target = Path(proc.stdout.strip())
+        self.assertFalse((target / ".gitignore").exists())
+        for rel_path in ("AGENTS.local.md", "CLAUDE.local.md", ".kiro/steering/agents-local-overlay.md"):
+            ignored = subprocess.run(
+                ["git", "check-ignore", "-q", "--", rel_path],
+                cwd=str(target),
+                capture_output=True,
+                env=isolated_env(),
+            )
+            self.assertEqual(ignored.returncode, 0, rel_path)
+        self.assertEqual(git_stdout(target, "status", "--porcelain"), "")
+
+    def test_reports_stale_registration_when_directory_was_deleted(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        first = self.create_worktree(repo, "feat1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        shutil.rmtree(first.stdout.strip())
+        second = self.create_worktree(repo, "feat1")
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("still registered as a worktree but its directory is gone", second.stderr)
+        self.assertIn("git worktree prune", second.stderr)
+        self.assertNotIn("must be outside every existing worktree", second.stderr)
+
+    def test_reports_stale_registration_through_symlinked_worktree_dir(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        real_parent = self.base / "real"
+        real_dir = real_parent / "wt"
+        real_dir.mkdir(parents=True)
+        (self.base / "alias").symlink_to(real_parent)
+        env = {
+            "HOME": str(self.home),
+            "AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR": str(self.base / "alias" / "wt"),
+        }
+        first = run_core(
+            ["claude-worktree-create"], repo, stdin=hook_stdin(repo, name="feat1"), extra_env=env
+        )
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertTrue(first.stdout.strip().startswith(str(real_dir)))
+        shutil.rmtree(first.stdout.strip())
+        second = run_core(
+            ["claude-worktree-create"], repo, stdin=hook_stdin(repo, name="feat1"), extra_env=env
+        )
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("still registered as a worktree but its directory is gone", second.stderr)
+        self.assertNotIn("must be outside every existing worktree", second.stderr)
+
+    def test_rejects_name_whose_worktree_still_exists(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        first = self.create_worktree(repo, "feat1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        second = self.create_worktree(repo, "feat1")
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("worktree target already exists", second.stderr)
+        self.assertNotIn("must be outside every existing worktree", second.stderr)
+        self.assertEqual(second.stdout, "")
+        self.assertEqual(self.worktree_count(repo), 2)
+
+    def test_rejects_name_whose_branch_still_exists(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        first = self.create_worktree(repo, "feat1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        run_git(repo, "worktree", "remove", "--force", first.stdout.strip())
+        second = self.create_worktree(repo, "feat1")
+        self.assertEqual(second.returncode, 1)
+        self.assertIn("branch agents-overlay/feat1 already exists", second.stderr)
+        self.assertIn("git branch -D agents-overlay/feat1", second.stderr)
+        self.assertEqual(second.stdout, "")
+
+    def test_rolls_back_worktree_when_copy_cannot_be_placed(self) -> None:
+        repo = make_repo(self.base)
+        (repo / "CLAUDE.local.md").write_text("tracked notes\n", encoding="utf-8")
+        run_git(repo, "add", "CLAUDE.local.md")
+        run_git(repo, "commit", "-qm", "track local bridge")
+        proc = self.create_worktree(repo, "feat1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("CLAUDE.local.md is tracked", proc.stderr)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(self.worktree_count(repo), 1)
+        self.assertFalse(self.branch_exists(repo, "agents-overlay/feat1"))
+        self.assertFalse(list(self.home.rglob("feat1")))
 
     def test_fails_on_invalid_local_source(self) -> None:
         repo = make_repo(self.base)
         (repo / "AGENTS.local.md").unlink()
         (repo / "AGENTS.local.md").symlink_to(repo / "AGENTS.md")
-        home = self.base / "home"
-        home.mkdir()
-        proc = run_core(
-            ["claude-worktree-create"],
-            repo,
-            stdin=hook_stdin(repo, name="feat1"),
-            extra_env={"HOME": str(home)},
-        )
+        proc = self.create_worktree(repo, "feat1")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("symlink", proc.stderr)
         self.assertEqual(proc.stdout, "")
 
     def test_rejects_unsafe_name(self) -> None:
         repo = make_repo(self.base)
-        proc = run_core(
-            ["claude-worktree-create"],
-            repo,
-            stdin=hook_stdin(repo, name="../evil"),
-            extra_env={"HOME": str(self.base)},
-        )
+        proc = self.create_worktree(repo, "../evil")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("simple slug", proc.stderr)
+
+
+class WorktreeRemoveTests(WorktreeHookTestCase):
+    def test_removes_hook_worktree_and_merged_branch(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        created = self.create_worktree(repo, "feat1")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        proc = self.remove_worktree(repo, target)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(target.exists())
+        self.assertEqual(self.worktree_count(repo), 1)
+        self.assertFalse(self.branch_exists(repo, "agents-overlay/feat1"))
+        again = self.create_worktree(repo, "feat1")
+        self.assertEqual(again.returncode, 0, again.stderr)
+
+    def test_keeps_branch_with_commits_on_no_other_ref(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        created = self.create_worktree(repo, "feat1")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        (target / "work.txt").write_text("wip\n", encoding="utf-8")
+        run_git(target, "add", "work.txt")
+        run_git(target, "commit", "-qm", "wip")
+        proc = self.remove_worktree(repo, target)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(target.exists())
+        self.assertTrue(self.branch_exists(repo, "agents-overlay/feat1"))
+        self.assertIn("kept branch agents-overlay/feat1", proc.stderr)
+
+    def test_deletes_branch_based_on_ref_not_merged_into_primary_head(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        run_git(repo, "branch", "develop")
+        run_git(repo, "checkout", "-q", "develop")
+        (repo / "dev.txt").write_text("dev\n", encoding="utf-8")
+        run_git(repo, "add", "dev.txt")
+        run_git(repo, "commit", "-qm", "develop only")
+        run_git(repo, "checkout", "-q", "-")
+        created = run_core(
+            ["claude-worktree-create"],
+            repo,
+            stdin=hook_stdin(repo, name="feat1"),
+            extra_env={"HOME": str(self.home), "AGENTS_OVERLAY_CLAUDE_WORKTREE_BASE_REF": "develop"},
+        )
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        proc = self.remove_worktree(repo, target)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(self.branch_exists(repo, "agents-overlay/feat1"))
+        self.assertEqual(proc.stderr, "")
+
+    def test_keeps_worktree_with_uncommitted_work(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        created = self.create_worktree(repo, "feat1")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        (target / "work.txt").write_text("wip\n", encoding="utf-8")
+        proc = self.remove_worktree(repo, target)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("git worktree remove", proc.stderr)
+        self.assertEqual((target / "work.txt").read_text(encoding="utf-8"), "wip\n")
+        self.assertEqual(self.worktree_count(repo), 2)
+        self.assertTrue(self.branch_exists(repo, "agents-overlay/feat1"))
+
+    def test_removes_hook_worktree_when_tag_shares_branch_name(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        created = self.create_worktree(repo, "feat1")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        run_git(repo, "tag", "agents-overlay/feat1")
+        proc = self.remove_worktree(repo, target)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(target.exists())
+        self.assertFalse(self.branch_exists(repo, "agents-overlay/feat1"))
+
+    def test_refuses_input_without_worktree_path(self) -> None:
+        repo = make_repo(self.base)
+        proc = run_core(["claude-worktree-remove"], repo, stdin=hook_stdin(repo))
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("missing worktree_path", proc.stderr)
+
+    def test_refuses_missing_path(self) -> None:
+        repo = make_repo(self.base)
+        proc = self.remove_worktree(repo, self.base / "nowhere")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("cannot enter project directory", proc.stderr)
+
+    def test_refuses_subdirectory_of_hook_worktree(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        created = self.create_worktree(repo, "feat1")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        sub = target / "sub"
+        sub.mkdir()
+        proc = self.remove_worktree(repo, sub)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not a linked worktree root", proc.stderr)
+        self.assertTrue(target.is_dir())
+
+    def test_refuses_worktree_not_created_by_hook(self) -> None:
+        repo = make_repo(self.base)
+        worktree = self.add_worktree(repo)
+        proc = self.remove_worktree(repo, worktree)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not created by the WorktreeCreate hook", proc.stderr)
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(self.worktree_count(repo), 2)
+
+    def test_refuses_primary_worktree(self) -> None:
+        repo = make_repo(self.base)
+        proc = self.remove_worktree(repo, repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not a linked worktree root", proc.stderr)
+        self.assertTrue((repo / "AGENTS.md").exists())
+
+    def test_refuses_hook_worktree_on_another_branch(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        created = self.create_worktree(repo, "feat1")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        target = Path(created.stdout.strip())
+        run_git(target, "checkout", "-q", "-b", "mine")
+        proc = self.remove_worktree(repo, target)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("not on branch agents-overlay/feat1", proc.stderr)
+        self.assertTrue(target.is_dir())
 
 
 class BareRepoTests(OverlayTestCase):

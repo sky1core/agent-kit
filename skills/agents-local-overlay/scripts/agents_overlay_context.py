@@ -30,7 +30,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -102,6 +102,7 @@ def usage() -> str:
         "  setup [dir]                create bridges, copies, ignore patterns\n"
         "  verify [dir]               check the repo against the contract\n"
         "  claude-worktree-create     WorktreeCreate hook\n"
+        "  claude-worktree-remove     WorktreeRemove hook\n"
     )
 
 
@@ -111,6 +112,8 @@ def usage() -> str:
 def run_git(
     cwd: Path, args: Sequence[str], check: bool = True
 ) -> subprocess.CompletedProcess[bytes]:
+    if not cwd.is_dir():
+        raise OverlayError(f"cannot run git in {cwd}: directory does not exist")
     try:
         proc = subprocess.run(
             ["git", *args],
@@ -235,17 +238,59 @@ def path_is_within(path: Path, ancestor: Path) -> bool:
     return True
 
 
+def worktrees_nest(a: Path, b: Path) -> bool:
+    return a != b and (path_is_within(a, b) or path_is_within(b, a))
+
+
 def worktree_nesting_problems(ctx: RepoContext) -> List[str]:
     problems: List[str] = []
     seen = ctx.worktrees
     for i, outer in enumerate(seen):
         for inner in seen[i + 1 :]:
-            if path_is_within(inner, outer) or path_is_within(outer, inner):
+            if worktrees_nest(outer, inner):
                 problems.append(
                     f"worktrees must not nest: {outer} and {inner}; "
                     "move one outside the other"
                 )
     return problems
+
+
+def drop_missing_worktrees(ctx: RepoContext, problems: List[str]) -> RepoContext:
+    """Report registered worktrees whose directory is gone and exclude them.
+
+    The primary is always present because resolve_context requires it.
+    """
+    present = []
+    for worktree in ctx.worktrees:
+        if worktree.is_dir():
+            present.append(worktree)
+            continue
+        problems.append(
+            f"{worktree} is registered as a worktree but does not exist; run "
+            "git worktree prune (deleted) or git worktree repair (moved)"
+        )
+    if len(present) == len(ctx.worktrees):
+        return ctx
+    return replace(ctx, worktrees=tuple(present))
+
+
+def worktree_topology_notices(ctx: RepoContext) -> List[str]:
+    """Delivery problems caused by where this checkout sits, not by its files."""
+    notices: List[str] = []
+    if ctx.top not in ctx.worktrees:
+        notices.append(
+            f"Rules not delivered: {ctx.top} is not in git worktree list (moved "
+            f"without git worktree move?); its {CLAUDE_LOCAL_BRIDGE} copy is not "
+            "refreshed — run git worktree repair, then agents-overlay-context setup"
+        )
+    for other in ctx.worktrees:
+        if worktrees_nest(ctx.top, other):
+            notices.append(
+                f"Rules may be duplicated: {ctx.top} nests with worktree {other}; "
+                "Claude loads rule files from both directories — move one outside "
+                "the other"
+            )
+    return notices
 
 
 # --- rule file IO ------------------------------------------------------------
@@ -308,6 +353,7 @@ def read_rule(path: Path) -> str:
 
 
 def atomic_write(path: Path, data: str) -> None:
+    file_mode = 0o644
     if path_exists(path):
         try:
             mode = path.lstat().st_mode
@@ -315,6 +361,7 @@ def atomic_write(path: Path, data: str) -> None:
             raise OverlayError(f"could not inspect {path}: {exc}") from exc
         if stat.S_ISLNK(mode) or not stat.S_ISREG(mode):
             raise OverlayError(f"{path} is not a regular file")
+        file_mode = stat.S_IMODE(mode) & 0o777
     tmp_path: Optional[Path] = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -327,7 +374,7 @@ def atomic_write(path: Path, data: str) -> None:
         ) as tmp:
             tmp_path = Path(tmp.name)
             tmp.write(data)
-        tmp_path.chmod(0o644)
+        tmp_path.chmod(file_mode)
         os.replace(tmp_path, path)
         tmp_path = None
     except OSError as exc:
@@ -561,6 +608,8 @@ def claude_session_notices(ctx: RepoContext) -> List[str]:
             "native CLAUDE.md channel this overlay relies on; unset it and start "
             "a new session"
         )
+    notices.extend(worktree_topology_notices(ctx))
+    local_exists = path_exists(local_source_path(ctx))
     local_text = read_optional_rule(local_source_path(ctx), notices)
     notices.extend(missing_shared_notices(ctx))
     notices.extend(stray_local_notices(ctx))
@@ -600,7 +649,9 @@ def claude_session_notices(ctx: RepoContext) -> List[str]:
                     f"the single-line {LOCAL_BRIDGE_MARKER} bridge; move extra "
                     f"content to {LOCAL_RULE} and run agents-overlay-context setup"
                 )
-    if ctx.top in ctx.copy_worktrees:
+    # An unreadable source is reported above and keeps the existing copy, the
+    # same as setup; only an absent source removes an orphan copy.
+    if ctx.top in ctx.copy_worktrees and (local_text is not None or not local_exists):
         refresh_generated_copy(ctx.top, local_text, notices)
     return notices
 
@@ -645,7 +696,7 @@ def claude_subagent_command(event: str, hook: dict) -> int:
 # --- Codex policies ----------------------------------------------------------
 
 
-def codex_precondition_notices(ctx: RepoContext) -> List[str]:
+def codex_kiro_precondition_notices(ctx: RepoContext) -> List[str]:
     notices: List[str] = []
     override = ctx.top / CODEX_OVERRIDE
     if path_exists(override):
@@ -698,9 +749,9 @@ def codex_hook_command(event: str, hook: dict, policy: str) -> int:
     ctx = resolve_context(hook_cwd(hook, policy))
     if not path_exists(local_source_path(ctx)):
         if stray_local_notices(ctx):
-            emit_json(event, notice_lines(codex_precondition_notices(ctx)))
+            emit_json(event, notice_lines(codex_kiro_precondition_notices(ctx)))
         return 0
-    notices = codex_precondition_notices(ctx)
+    notices = codex_kiro_precondition_notices(ctx)
     local_text = read_optional_rule(local_source_path(ctx), notices)
     body = labeled_rules([(LOCAL_RULE, local_text)]) if local_text is not None else ""
     if body and len(body) > CODEX_MAX_CHARS:
@@ -781,7 +832,7 @@ def kiro_body_command(argv: Sequence[str]) -> int:
     refusal = kiro_inheritance_refusal(ctx.top, fix=True)
     if refusal:
         fail(f"agents-overlay-context: {refusal}")
-    for notice in codex_precondition_notices(ctx):
+    for notice in codex_kiro_precondition_notices(ctx):
         fail(f"agents-overlay-context: {notice}")
     local = local_source_path(ctx)
     if not path_exists(local):
@@ -863,14 +914,7 @@ def ensure_ignores(ctx: RepoContext, changes: List[str], problems: List[str]) ->
                 changes.append(f"{gitignore}: added ignore pattern {rel_path}")
                 uncovered = [w for w in uncovered if not git_check_ignore(w, rel_path)]
             if uncovered:
-                # The shared info/exclude covers every worktree regardless of
-                # which .gitignore each checkout carries.
-                exclude = ctx.common / "info" / "exclude"
-                try:
-                    exclude.parent.mkdir(parents=True, exist_ok=True)
-                except OSError as exc:
-                    raise OverlayError(f"could not create {exclude.parent}: {exc}") from exc
-                append_ignore_pattern(exclude, rel_path)
+                exclude = append_shared_exclude(ctx, rel_path)
                 changes.append(f"{exclude}: added ignore pattern {rel_path}")
                 remaining = [w for w in uncovered if not git_check_ignore(w, rel_path)]
                 for worktree in remaining:
@@ -880,6 +924,18 @@ def ensure_ignores(ctx: RepoContext, changes: List[str], problems: List[str]) ->
                     )
         except OverlayError as exc:
             problems.append(str(exc))
+
+
+def append_shared_exclude(ctx: RepoContext, rel_path: str) -> Path:
+    # The shared info/exclude covers every worktree regardless of which
+    # .gitignore each checkout carries.
+    exclude = ctx.common / "info" / "exclude"
+    try:
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OverlayError(f"could not create {exclude.parent}: {exc}") from exc
+    append_ignore_pattern(exclude, rel_path)
+    return exclude
 
 
 # --- setup -------------------------------------------------------------------
@@ -922,6 +978,7 @@ def setup_command(argv: Sequence[str]) -> int:
     ctx = resolve_context(project_dir, require_git=True)
     changes: List[str] = []
     problems: List[str] = []
+    ctx = drop_missing_worktrees(ctx, problems)
     problems.extend(worktree_nesting_problems(ctx))
 
     shared_exists = path_exists(shared_source_path(ctx))
@@ -1237,6 +1294,7 @@ def verify_command(argv: Sequence[str]) -> int:
     ctx = resolve_context(project_dir, require_git=True)
     problems: List[str] = []
     warnings: List[str] = []
+    ctx = drop_missing_worktrees(ctx, problems)
     problems.extend(worktree_nesting_problems(ctx))
 
     shared_worktrees = [
@@ -1455,38 +1513,152 @@ def prepare_dir(path: Path) -> None:
         raise OverlayError(f"could not create directory {path}: {exc}") from exc
 
 
+def claude_worktree_repo_dir(ctx: RepoContext) -> Path:
+    repo_part = slug_component(ctx.root.name)
+    repo_key = hashlib.sha256(str(ctx.common).encode("utf-8")).hexdigest()[:12]
+    return claude_worktree_base_dir() / f"{repo_part}-{repo_key}"
+
+
+def claude_worktree_branch(name: str) -> str:
+    return f"agents-overlay/{name}"
+
+
+def git_branch_exists(cwd: Path, branch: str) -> bool:
+    proc = run_git(
+        cwd, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], check=False
+    )
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    raise OverlayError(f"could not check whether branch {branch} exists")
+
+
+def ensure_worktree_ignores(ctx: RepoContext, worktree: Path) -> None:
+    for rel_path in ignore_targets(ctx):
+        if git_tracked(worktree, rel_path):
+            raise OverlayError(f"{rel_path} is tracked in {worktree}; untrack it before ignoring")
+        if git_check_ignore(worktree, rel_path):
+            continue
+        exclude = append_shared_exclude(ctx, rel_path)
+        if not git_check_ignore(worktree, rel_path):
+            raise OverlayError(
+                f"{rel_path} is still not ignored in {worktree} after adding it to "
+                f"{exclude}; check negated ignore rules"
+            )
+
+
+def discard_claude_worktree(ctx: RepoContext, target: Path, branch: str) -> List[str]:
+    """Undo a partially created hook worktree; returns what could not be undone."""
+    leftovers: List[str] = []
+    removed = run_git(ctx.root, ["worktree", "remove", "--force", str(target)], check=False)
+    if removed.returncode != 0:
+        leftovers.append(f"worktree {target} still exists")
+    deleted = run_git(ctx.root, ["branch", "-D", branch], check=False)
+    if deleted.returncode != 0:
+        leftovers.append(f"branch {branch} still exists")
+    return leftovers
+
+
+def branch_tip_on_other_ref(cwd: Path, branch: str) -> bool:
+    own = f"refs/heads/{branch}"
+    proc = run_git(
+        cwd,
+        ["for-each-ref", "--contains", own, "--format=%(refname)", "refs/heads", "refs/remotes"],
+    )
+    refs = proc.stdout.decode("utf-8", "replace").split("\n")
+    return any(ref and ref != own for ref in refs)
+
+
 def claude_worktree_create_command() -> int:
     hook = parse_hook_object(sys.stdin.read(), "claude-worktree-create")
     project_dir = hook_cwd(hook, "claude-worktree-create")
     ctx = resolve_context(project_dir, require_git=True)
     name = safe_slug(hook.get("name"), "name")
-    repo_part = slug_component(ctx.root.name)
-    repo_key = hashlib.sha256(str(ctx.common).encode("utf-8")).hexdigest()[:12]
-    base_dir = claude_worktree_base_dir()
-    repo_dir = base_dir / f"{repo_part}-{repo_key}"
+    repo_dir = claude_worktree_repo_dir(ctx)
     target = repo_dir / name
+    branch = claude_worktree_branch(name)
+    if resolved_or_self(target) in ctx.worktrees and not target.is_dir():
+        raise OverlayError(
+            f"{target} is still registered as a worktree but its directory is gone; "
+            f"run git worktree prune (and git branch -D {branch} if the branch is "
+            "not needed), then retry"
+        )
+    if path_exists(target):
+        raise OverlayError(
+            f"worktree target already exists: {target}; choose another name or "
+            "remove it with git worktree remove"
+        )
     for existing in ctx.worktrees:
         if path_is_within(target, existing):
             raise OverlayError(
                 f"worktree target must be outside every existing worktree: {target}"
             )
-    if path_exists(target):
-        raise OverlayError(f"worktree target already exists: {target}")
+    if git_branch_exists(ctx.top, branch):
+        raise OverlayError(
+            f"branch {branch} already exists from an earlier worktree named {name}; "
+            f"merge or delete it (git branch -D {branch}) or choose another name"
+        )
     local_text: Optional[str] = None
     local = local_source_path(ctx)
     if path_exists(local):
         local_text = read_rule(local)
-    prepare_dir(base_dir)
+    prepare_dir(repo_dir.parent)
     prepare_dir(repo_dir)
     base_ref = os.environ.get(CLAUDE_WORKTREE_BASE_ENV, "HEAD")
-    branch = f"agents-overlay/{name}"
     run_git(ctx.top, ["worktree", "add", "-q", "-b", branch, str(target), base_ref])
-    if local_text is not None:
-        copy_notices: List[str] = []
-        refresh_generated_copy(target, local_text, copy_notices)
-        if copy_notices:
-            raise OverlayError(copy_notices[0])
-    sys.stdout.write(str(target.resolve(strict=True)) + "\n")
+    try:
+        if local_text is not None:
+            ensure_worktree_ignores(ctx, target)
+            copy_notices: List[str] = []
+            refresh_generated_copy(target, local_text, copy_notices)
+            if copy_notices:
+                raise OverlayError(copy_notices[0])
+        resolved = target.resolve(strict=True)
+    except (OverlayError, OSError) as exc:
+        leftovers = discard_claude_worktree(ctx, target, branch)
+        detail = str(exc)
+        if leftovers:
+            detail += "; rollback incomplete: " + ", ".join(leftovers)
+        raise OverlayError(detail) from exc
+    sys.stdout.write(str(resolved) + "\n")
+    return 0
+
+
+def claude_worktree_remove_command() -> int:
+    hook = parse_hook_object(sys.stdin.read(), "claude-worktree-remove")
+    raw_path = hook.get("worktree_path")
+    if not isinstance(raw_path, str) or not raw_path:
+        raise OverlayError("WorktreeRemove hook input missing worktree_path")
+    ctx = resolve_context(raw_path, require_git=True)
+    target = ctx.top
+    if ctx.start != target or target == ctx.root or target not in ctx.worktrees:
+        raise OverlayError(f"{raw_path} is not a linked worktree root")
+    if target.parent != resolved_or_self(claude_worktree_repo_dir(ctx)):
+        raise OverlayError(
+            f"{target} was not created by the WorktreeCreate hook; remove it with "
+            "git worktree remove"
+        )
+    branch = claude_worktree_branch(target.name)
+    head = run_git(target, ["symbolic-ref", "--quiet", "HEAD"], check=False)
+    head_ref = head.stdout.decode("utf-8", "replace").strip()
+    if head.returncode != 0 or head_ref != f"refs/heads/{branch}":
+        raise OverlayError(
+            f"{target} is not on branch {branch}; remove it with git worktree remove"
+        )
+    # No --force: git refuses a worktree with modified or untracked files, which
+    # keeps that work in place; the ignored generated copy does not block removal.
+    run_git(ctx.root, ["worktree", "remove", str(target)])
+    # Claude surfaces this hook's stderr only in debug logs, so a kept branch
+    # becomes visible at the next same-name create instead.
+    if branch_tip_on_other_ref(ctx.root, branch):
+        run_git(ctx.root, ["branch", "-D", branch])
+        return 0
+    print(
+        f"agents-overlay-context: kept branch {branch}; its commits are on no other "
+        f"branch — merge it or run git branch -D {branch} before reusing the name",
+        file=sys.stderr,
+    )
     return 0
 
 
@@ -1526,6 +1698,8 @@ def main(argv: Sequence[str]) -> int:
             return verify_command(rest)
         if command == "claude-worktree-create":
             return claude_worktree_create_command()
+        if command == "claude-worktree-remove":
+            return claude_worktree_remove_command()
         fail(f"agents-overlay-context: unknown command {command}\n" + usage())
         return 1
     except QuietExit:

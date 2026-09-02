@@ -42,10 +42,12 @@ context에 넣고, `verify`가 실패한다.
 - `AGENTS.override.md`는 쓰지 않는다. Codex가 같은 디렉터리의 `AGENTS.md`를
   완전히 대체하기 때문이다. 발견되면 `verify`가 실패하고 Kiro launcher는
   중단하며, `AGENTS.local.md`를 쓰는 repo에서는 hook도 notice를 낸다.
-- hook의 notice는 이 규약을 쓰는 repo에서만 나온다. `AGENTS.local.md`(또는 그
-  생성 복사본이나 local bridge)가 없는 repo에서 hook은 침묵하고, subagent
-  주입은 존재하는 rule 파일만 넣는다. overlay를 쓰지 않는 일반 repo에 세션마다
-  잔소리를 내지 않기 위한 의도된 범위다.
+- 세션 hook의 notice는 이 규약을 쓰는 repo에서만 나온다. `AGENTS.local.md`(또는
+  그 생성 복사본이나 local bridge)가 없는 repo에서 SessionStart hook은 침묵한다.
+  overlay를 쓰지 않는 일반 repo에 세션마다 잔소리를 내지 않기 위한 의도된
+  범위다. SubagentStart 주입은 opt-in과 무관하게 존재하는 rule 파일만 넣되,
+  그 worktree에 `AGENTS.md`가 없는데 primary에는 있거나 primary 밖 worktree에
+  독립 `AGENTS.local.md`가 있으면 notice를 낸다.
 - bridge는 의미상 한 import 줄만 인정한다. `setup`은 BOM, CRLF/CR,
   `@./AGENTS.md` 같은 변형을 LF 한 줄로 정규화하고, 설명문이나 다른 내용이
   섞인 bridge는 고치지 않고 실패한다.
@@ -71,7 +73,12 @@ record가 bare metadata dir이며 source도 그 안에 둔다.
   worktree의 hook이 notice를 낸다.
 - worktree는 서로 어떤 조합으로도 중첩하지 않는다. Claude의 parent 디렉터리
   `CLAUDE.md` discovery가 바깥 worktree의 rule을 함께 읽어 중복되기 때문이다.
-  `verify`가 모든 worktree 쌍을 검사해 실패로 보고한다.
+  `verify`가 모든 worktree 쌍을 검사해 실패로 보고하고, 중첩된 worktree의
+  세션 hook도 `Rules may be duplicated` notice를 낸다.
+- worktree를 `git worktree move` 없이 옮기면 `git worktree list`에 새 위치가
+  없으므로 세션 hook은 복사본을 갱신하지 않고 notice를 낸다. `git worktree
+  repair` 후 `setup`을 다시 실행한다. 등록됐지만 디렉터리가 없는 worktree는
+  `verify`가 FAIL로 보고한다(`git worktree prune` 또는 `repair`).
 
 ## Repo 세팅
 
@@ -96,6 +103,10 @@ agents-overlay-context verify
   세 경로의 tracked/ignored 상태를 worktree마다 검사한다.
 - 마지막에 `verify`를 실행한다. tracked 로컬 파일, 내용이 섞인 bridge,
   overlay가 만들지 않은 `CLAUDE.local.md`는 덮어쓰지 않고 실패한다.
+
+`CLAUDE.md` bridge와 `.gitignore`의 ignore pattern은 repo 정책이 허용하면
+commit해 둔다. commit하지 않으면 새 worktree마다 `setup`을 다시 실행해야
+하고, 그때까지 그 worktree의 세션 hook이 bridge 부재 notice를 낸다.
 
 ## Machine 세팅
 
@@ -159,6 +170,16 @@ done
           }
         ]
       }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$HOME/.local/bin/agents-overlay-context\" claude-worktree-remove"
+          }
+        ]
+      }
     ]
   }
 }
@@ -190,7 +211,29 @@ done
   `$HOME/.cache/agents-local-overlay/claude-worktrees/<repo>-<hash>/<name>`,
   `AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR`로 변경한다. base ref 기본값은 `HEAD`,
   `AGENTS_OVERLAY_CLAUDE_WORKTREE_BASE_REF`로 변경한다. branch 이름은
-  `agents-overlay/<name>`이다. `.worktreeinclude`는 적용되지 않는다.
+  `agents-overlay/<name>`이다. `.worktreeinclude`는 적용되지 않는다. 로컬
+  source가 있으면 복사본을 쓰기 전에 `AGENTS.local.md`, `CLAUDE.local.md`,
+  `.kiro/steering/agents-local-overlay.md`가 새 worktree에서 ignored인지
+  확인하고, 아니면 shared `info/exclude`에 보충한다. 복사본을 둘 수 없으면
+  worktree와 branch를 되돌리고 실패한다(`info/exclude`에 보충한 pattern은
+  남는다). 같은 이름의 worktree나 branch가 남아 있으면 만들지 않고
+  실패하므로, worktree는 제거하고 branch는 merge하거나 `git branch -D`로 지운
+  뒤 다시 만든다. worktree 디렉터리를 `git worktree remove` 없이 지운 뒤 같은
+  이름을 쓰면 `git worktree prune`을 안내하고 실패한다.
+- `claude-worktree-remove`는 `claude-worktree-create`가 만든 worktree만
+  제거한다. create 때와 같은 `AGENTS_OVERLAY_CLAUDE_WORKTREE_DIR` 기준
+  `<repo>-<hash>` 디렉터리의 바로 아래에 있고 `agents-overlay/<name>` branch를
+  checkout한 worktree여야 하며, 그 외는 제거하지 않고 실패한다. `--force` 없이
+  제거하므로 수정된 tracked 파일이나 untracked 파일이 있으면 git이 거부해
+  실패하고 worktree는 그대로 남는다(ignored인 생성 복사본은 제거를 막지
+  않는다). 제거 후 branch는 tip commit이 다른 local·remote branch에 포함돼 있을
+  때만 지우고, 아니면 남긴다. Claude는 이 hook의 stderr와 실패를 debug
+  로그에서만 보여주므로, 남은 worktree와 branch는 같은 이름으로 다음 create할
+  때의 실패 메시지로 드러난다. Claude가 이 hook을 호출하는 시점과 자체 정리와의
+  순서는 Claude 문서의 WorktreeRemove 계약을 따르며 live 검증 범위에 들어
+  있지 않다. `claude rm`으로 background 세션을 지우는 경로는 이 hook을 거치지
+  않아 worktree 등록과 branch가 남는다 — `git worktree prune`과 `git branch -D
+  agents-overlay/<name>`으로 정리한다.
 - hook 프로세스가 관찰할 수 없는 one-session 설정(`--settings`,
   `--setting-sources`, SDK `settingSources`, managed settings)으로 native
   memory나 hook을 끄는 실행은 이 규약의 보증 대상이 아니다.
@@ -259,6 +302,10 @@ kiro-cli-overlay
 - 생성 파일은 launcher 전용 첫 줄이 있는 regular file이어야 하며, tracked
   이거나 ignored가 아니면 중단한다. `.kiro`, `.kiro/steering`, 생성 파일이
   symlink면 중단한다.
+- 공용 채널 전제가 깨져도 중단한다: `AGENTS.override.md`가 있음, 이 worktree에
+  `AGENTS.md`가 없는데 primary에는 있음, `AGENTS.md`가 symlink·non-UTF-8·NUL
+  포함, primary 밖 worktree에 독립 `AGENTS.local.md`가 있음, 로컬 body가
+  32,768자 초과. 중단 사유는 stderr로 출력한다.
 - raw `kiro-cli`와 `kiro-cli chat --no-interactive`는 steering 동기화를
   우회하므로 보증 대상이 아니다.
 
@@ -325,8 +372,9 @@ done
   primary source 존재 여부와 무관하게 `verify`가 실패로 보고하고, 그 worktree의
   세션 hook도 notice를 낸다.
 - hook의 notice는 세션이 실행되는 worktree 기준으로만 판단한다(그 worktree의
-  `AGENTS.override.md`, `AGENTS.md` 부재·유효성, 독립 `AGENTS.local.md`).
-  다른 worktree까지 포함한 전체 검사는 `verify` 소관이다.
+  `AGENTS.override.md`, `AGENTS.md` 부재·유효성, 독립 `AGENTS.local.md`,
+  `git worktree list` 등록 여부, 다른 worktree와의 중첩). 다른 worktree까지
+  포함한 전체 검사는 `verify` 소관이다.
 - nested `CLAUDE.md`, 하위 디렉터리의 `AGENTS.md`는 각 CLI의 native 기능이고
   이 규약의 계약 밖이므로 검사하지 않는다.
 - wrapper나 Python core 실행 자체가 실패하면 hook 오류로 드러난다. Claude
