@@ -7,9 +7,9 @@ One delivery channel per logical rule source per CLI context, fixed statically:
   AGENTS.local.md via CLAUDE.local.md (primary worktree: one-line bridge
   import; other worktrees: generated content copy refreshed by the
   SessionStart hook before native memory is read).
-- Claude subagent: subagents do not receive native memory, so the
-  SubagentStart hook injects the shared+local snapshot (fork inherits the
-  parent context and gets nothing).
+- Claude subagent: the built-in Explore and Plan subagents start without native
+  memory, so the SubagentStart hook injects the shared+local snapshot for them
+  only; every other subagent inherits the main session's project+local memory.
 - Codex: AGENTS.md via the native project doc loader; AGENTS.local.md via the
   SessionStart/SubagentStart hook.
 - Kiro: AGENTS.md via the native default-resource channel; AGENTS.local.md via
@@ -54,13 +54,9 @@ GENERATED_LOCAL_OWNER = (
 )
 
 NOTICE_PREFIX = "[agents-local-overlay] "
-# Live-verified (Claude 2.1.252): only the built-in Explore and Plan subagents
-# start without the native CLAUDE.md memory hierarchy, so they are the only ones
-# that need the hook to inject the rules. general-purpose, custom, and plugin
-# subagents already receive project + local memory natively; injecting for them
-# would duplicate the rules. The hook cannot tell a custom agent named "Explore"
-# or "Plan" apart from the built-ins, so those two names are treated as the
-# memory-less built-ins.
+# Live-verified (Claude 2.1.252): only built-in Explore and Plan start without
+# native CLAUDE.md memory; every other subagent inherits it, so injecting there
+# duplicates the rules. A custom agent named Explore/Plan is indistinguishable.
 SUBAGENTS_WITHOUT_NATIVE_MEMORY = frozenset({"Explore", "Plan"})
 CLAUDE_MAX_CHARS = 10000
 CODEX_MAX_CHARS = 32768
@@ -619,6 +615,12 @@ def claude_session_command(event: str, hook: dict) -> int:
 
 def claude_subagent_command(event: str, hook: dict) -> int:
     agent_type = hook.get("agent_type")
+    if not isinstance(agent_type, str):
+        emit_json(
+            event,
+            notice_lines(["SubagentStart payload has no string agent_type; rules not injected"]),
+        )
+        return 0
     if agent_type not in SUBAGENTS_WITHOUT_NATIVE_MEMORY:
         return 0
     ctx = resolve_context(hook_cwd(hook, "claude-subagent"))
@@ -1013,16 +1015,22 @@ def codex_config_path() -> Path:
     return base / "config.toml"
 
 
+CLAUDE_GLOB_UNSUPPORTED = re.compile(r"[{}\[\]()!]")
+
+
 def claude_glob_to_regex(pattern: str) -> str:
-    pattern = pattern.replace("\\", "/")
     out: List[str] = []
     i, n = 0, len(pattern)
     while i < n:
         c = pattern[i]
         if c == "*":
-            if i + 1 < n and pattern[i + 1] == "*":
-                j = i + 2
-                if j < n and pattern[j] == "/":
+            j = i
+            while j < n and pattern[j] == "*":
+                j += 1
+            segment_start = i == 0 or pattern[i - 1] == "/"
+            segment_end = j == n or pattern[j] == "/"
+            if j - i >= 2 and segment_start and segment_end:
+                if j < n:
                     out.append("(?:.*/)?")
                     i = j + 1
                 else:
@@ -1030,7 +1038,7 @@ def claude_glob_to_regex(pattern: str) -> str:
                     i = j
             else:
                 out.append("[^/]*")
-                i += 1
+                i = j
         elif c == "?":
             out.append("[^/]")
             i += 1
@@ -1040,23 +1048,26 @@ def claude_glob_to_regex(pattern: str) -> str:
     return "^" + "".join(out) + "$"
 
 
-def claude_md_excluded(patterns: Sequence[str], path: Path) -> bool:
-    # Mirrors Claude's claudeMdExcludes matching: absolute file paths, backslashes
-    # normalized to forward slashes, glob with ** / * / ? plus exact paths.
+def claude_md_excluded(patterns: Sequence[str], path: Path) -> Tuple[bool, List[str]]:
+    # Evaluates the claudeMdExcludes subset this script understands: exact
+    # absolute paths and globs made of **, * and ?, with backslashes normalized.
+    # Claude itself matches with picomatch, so patterns using braces, character
+    # classes, extglob or negation are reported back as unevaluable, not guessed.
     candidates = {str(path).replace("\\", "/"), str(resolved_or_self(path)).replace("\\", "/")}
+    unevaluable: List[str] = []
     for raw in patterns:
         if not isinstance(raw, str) or not raw:
             continue
         pattern = raw.replace("\\", "/")
         if pattern in candidates:
-            return True
-        try:
-            regex = re.compile(claude_glob_to_regex(pattern))
-        except re.error:
+            return True, []
+        if CLAUDE_GLOB_UNSUPPORTED.search(pattern):
+            unevaluable.append(raw)
             continue
+        regex = re.compile(claude_glob_to_regex(pattern))
         if any(regex.match(c) for c in candidates):
-            return True
-    return False
+            return True, []
+    return False, unevaluable
 
 
 CLAUDE_SETTINGS_LAYERS = (
@@ -1067,11 +1078,13 @@ CLAUDE_SETTINGS_LAYERS = (
 
 
 def read_claude_settings(path: Path, problems: List[str]) -> Optional[dict]:
-    if not path_exists(path):
-        return None
+    # Settings files are Claude's, not overlay rule files: Claude follows a
+    # symlinked settings.json, so this reader must too.
     try:
-        data = read_regular_file_bytes(path).decode("utf-8")
-    except (OverlayError, UnicodeDecodeError) as exc:
+        data = path.read_bytes().decode("utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
         problems.append(f"could not read {path}: {exc}")
         return None
     try:
@@ -1082,8 +1095,9 @@ def read_claude_settings(path: Path, problems: List[str]) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
-def claude_settings_findings(ctx: RepoContext) -> List[str]:
+def claude_settings_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
     problems: List[str] = []
+    warnings: List[str] = []
     user_path = Path.home() / ".claude" / "settings.json"
     user = read_claude_settings(user_path, problems)
     seen: set = set()
@@ -1125,7 +1139,8 @@ def claude_settings_findings(ctx: RepoContext) -> List[str]:
         for bridge in bridges:
             if not path_exists(bridge):
                 continue
-            if claude_md_excluded(patterns, bridge):
+            matched, unevaluable = claude_md_excluded(patterns, bridge)
+            if matched:
                 msg = (
                     f"claudeMdExcludes matches {bridge}; Claude will not load that "
                     "bridge, so the rules it carries are silently dropped — remove "
@@ -1134,7 +1149,17 @@ def claude_settings_findings(ctx: RepoContext) -> List[str]:
                 if msg not in seen:
                     seen.add(msg)
                     problems.append(msg)
-    return problems
+            elif unevaluable:
+                msg = (
+                    "claudeMdExcludes pattern(s) "
+                    + ", ".join(repr(p) for p in unevaluable)
+                    + " use brace, character-class, extglob or negation syntax this "
+                    f"check does not evaluate; confirm they do not match {bridge}"
+                )
+                if msg not in seen:
+                    seen.add(msg)
+                    warnings.append(msg)
+    return problems, warnings
 
 
 def codex_verify_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
@@ -1343,7 +1368,9 @@ def verify_command(argv: Sequence[str]) -> int:
             )
 
     if shared_worktrees or local_exists:
-        problems.extend(claude_settings_findings(ctx))
+        settings_problems, settings_warnings = claude_settings_findings(ctx)
+        problems.extend(settings_problems)
+        warnings.extend(settings_warnings)
 
     codex_problems, codex_warnings = codex_verify_findings(ctx)
     problems.extend(codex_problems)

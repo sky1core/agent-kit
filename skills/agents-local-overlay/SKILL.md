@@ -182,8 +182,9 @@ done
   true면 subagent 주입·session notice hook 자체가 안 뜨고, `claudeMdExcludes`가
   `CLAUDE.md`/`CLAUDE.local.md` bridge 경로를 매칭하면 native bridge가 로드에서
   빠진다. 둘 다 런타임 hook으로는 잡히지 않으므로 `verify`가 세 계층 설정을
-  읽어 해당 시 FAIL한다. managed/policy 설정과 one-session `--settings`는
-  보증 밖이다.
+  읽어 해당 시 FAIL한다. `claudeMdExcludes` 판정은 절대경로와 `**`·`*`·`?`
+  glob만 평가하고, brace·character class·extglob·negation이 든 패턴은 WARN으로
+  직접 확인을 요구한다.
 - `claude-worktree-create`는 Claude `--worktree`의 기본 nested 배치를 primary
   밖의 git worktree로 바꾸고 생성 복사본까지 만든다. 기본 위치는
   `$HOME/.cache/agents-local-overlay/claude-worktrees/<repo>-<hash>/<name>`,

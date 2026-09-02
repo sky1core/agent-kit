@@ -300,13 +300,94 @@ class VerifyTests(OverlayTestCase):
 
     def test_ignores_claude_settings_in_non_overlay_repo(self) -> None:
         # A plain repo with no shared/local source has no overlay Claude channel,
-        # so a global disableAllHooks must not produce a finding.
+        # so its project-level disableAllHooks must not produce a finding.
         repo = self.base / "plain"
         repo.mkdir()
         run_git(repo, "init", "-q")
         self._write_claude_settings(repo, {"disableAllHooks": True})
         proc = run_core(["verify"], repo)
         self.assertNotIn("disableAllHooks", proc.stdout)
+
+    def _user_home_with_claude_settings(self, data: dict) -> dict:
+        home = self.base / "home"
+        (home / ".claude").mkdir(parents=True)
+        (home / ".claude" / "settings.json").write_text(json.dumps(data), encoding="utf-8")
+        return {"HOME": str(home)}
+
+    def test_fails_on_disable_all_hooks_in_user_settings(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        env = self._user_home_with_claude_settings({"disableAllHooks": True})
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("disableAllHooks is true", proc.stdout)
+        self.assertIn(str(self.base / "home"), proc.stdout)
+
+    def test_local_settings_override_user_disable_all_hooks(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        env = self._user_home_with_claude_settings({"disableAllHooks": True})
+        self._write_claude_settings(repo, {"disableAllHooks": False}, local=True)
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+    def test_claude_md_excludes_merge_across_layers(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        env = self._user_home_with_claude_settings(
+            {"claudeMdExcludes": ["**/CLAUDE.md"]}
+        )
+        self._write_claude_settings(
+            repo, {"claudeMdExcludes": ["**/CLAUDE.local.md"]}, local=True
+        )
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 1)
+        self.assertEqual(proc.stdout.count("claudeMdExcludes matches"), 2)
+        self.assertIn("/CLAUDE.md;", proc.stdout)
+        self.assertIn("/CLAUDE.local.md;", proc.stdout)
+
+    def test_reads_symlinked_claude_settings(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        dotfiles = self.base / "dotfiles"
+        dotfiles.mkdir()
+        (dotfiles / "settings.json").write_text(
+            json.dumps({"disableAllHooks": True}), encoding="utf-8"
+        )
+        (repo / ".claude").mkdir()
+        (repo / ".claude" / "settings.json").symlink_to(dotfiles / "settings.json")
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("disableAllHooks is true", proc.stdout)
+        self.assertNotIn("could not read", proc.stdout)
+
+    def test_claude_md_excludes_absolute_and_globstar_patterns(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        parent = str(repo.resolve().parent)
+        cases = {
+            f"{repo.resolve()}/CLAUDE.md": 1,
+            f"{parent}/**": 1,
+            f"{parent}/**/CLAUDE.md": 1,
+            f"{parent}/*/CLAUDE.m?": 1,
+            f"{parent}/**CLAUDE.md": 0,
+            f"{parent}/*/*/CLAUDE.md": 0,
+        }
+        for pattern, expected in cases.items():
+            self._write_claude_settings(repo, {"claudeMdExcludes": [pattern]})
+            proc = run_core(["verify"], repo)
+            self.assertEqual(proc.returncode, expected, f"{pattern}: {proc.stdout}")
+
+    def test_warns_on_unevaluable_claude_md_excludes_pattern(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        self._write_claude_settings(
+            repo, {"claudeMdExcludes": ["**/CLAUDE.{md,local.md}"]}
+        )
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("WARN: claudeMdExcludes pattern(s)", proc.stdout)
+        self.assertIn("does not evaluate", proc.stdout)
 
     def test_warns_outside_cli_version_window(self) -> None:
         repo = make_repo(self.base)
@@ -652,6 +733,15 @@ class ClaudeSubagentHookTests(OverlayTestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
+
+    def test_missing_agent_type_emits_notice_only(self) -> None:
+        repo = make_repo(self.base)
+        for stdin in (hook_stdin(repo), hook_stdin(repo, agent_type=["Explore"])):
+            proc = run_core(CLAUDE_SUBAGENT, repo, stdin=stdin)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            context = hook_context(proc)
+            self.assertIn("no string agent_type", context)
+            self.assertNotIn("shared rule X", context)
 
     def test_over_cap_replaces_body_with_notice(self) -> None:
         repo = make_repo(self.base)
