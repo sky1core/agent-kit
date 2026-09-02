@@ -33,10 +33,12 @@ context에 넣고, `verify`가 실패한다.
 ## 전제
 
 - `git` 2.36 이상과 `python3` 3.11 이상(`tomllib` 필요)이 필요하다.
-- live 검증 범위는 Claude Code 2.1.232..2.1.252, Codex CLI 0.147.0..0.152.0,
-  Kiro CLI 2.15.1..2.20.2의 v3 engine이다. `verify`는 설치된 CLI의 `--version`이
-  이 윈도우 밖이거나 판정 불가면 WARN을 낸다. 새 버전에서 live canary를 통과하면
-  윈도우를 넓힌다.
+- Claude Code 2.1.232, Codex CLI 0.147.0, Kiro CLI 2.15.1(v3 engine) 이상을
+  전제한다. 이 스킬이 쓰는 CLI 인터페이스(hook 이벤트, Kiro v3 engine·settings
+  조회)가 그 미만에서는 없을 수 있으므로, `verify`는 설치된 CLI의 `--version`이
+  이보다 낮거나 판정 불가면 WARN을 낸다.
+  그 이상의 버전은 각 CLI의 문서 계약(hook 입력·native memory 로드 범위)을
+  따르는 것으로 보고 버전으로 판정하지 않는다.
 - `AGENTS.md`, `AGENTS.local.md`, `CLAUDE.md`, `CLAUDE.local.md`는 NUL이 없는
   UTF-8 regular file이어야 한다. rule/bridge 파일의 symlink는 읽지 않는다.
 - `AGENTS.override.md`는 쓰지 않는다. Codex가 같은 디렉터리의 `AGENTS.md`를
@@ -189,7 +191,8 @@ done
   복사본을 원본과 동기화하고, 전제조건이 깨졌을 때만 notice를 넣는다. resume
   에서도 같은 hook이 복사본을 갱신한다.
 - `SubagentStart`는 `agent_type`이 built-in `Explore`·`Plan`일 때만 공용·로컬
-  snapshot을 주입한다. 이 둘만 native memory를 받지 않기 때문이다.
+  snapshot을 주입한다. Claude 문서(sub-agents의 subagent context 항목)가 이
+  둘만 `CLAUDE.md`를 생략한다고 명시하기 때문이다.
   general-purpose·custom·plugin·fork subagent는 메인 세션의 project·local
   memory를 native로 상속하므로 주입하지 않는다(주입 시 중복). 주입 예산은 합산
   10,000자이며 넘으면 rule 대신 notice가 들어가고 `verify`가 실패한다.
@@ -230,8 +233,8 @@ done
   때만 지우고, 아니면 남긴다. Claude는 이 hook의 stderr와 실패를 debug
   로그에서만 보여주므로, 남은 worktree와 branch는 같은 이름으로 다음 create할
   때의 실패 메시지로 드러난다. Claude가 이 hook을 호출하는 시점과 자체 정리와의
-  순서는 Claude 문서의 WorktreeRemove 계약을 따르며 live 검증 범위에 들어
-  있지 않다. `claude rm`으로 background 세션을 지우는 경로는 이 hook을 거치지
+  순서는 Claude 문서의 WorktreeRemove 계약을 따르며, 이 스킬은 그 순서를
+  검사하지 않는다. `claude rm`으로 background 세션을 지우는 경로는 이 hook을 거치지
   않아 worktree 등록과 branch가 남는다 — `git worktree prune`과 `git branch -D
   agents-overlay/<name>`으로 정리한다.
 - hook 프로세스가 관찰할 수 없는 one-session 설정(`--settings`,

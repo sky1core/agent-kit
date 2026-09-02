@@ -412,44 +412,45 @@ class VerifyTests(OverlayTestCase):
         self.assertIn("WARN: claudeMdExcludes pattern(s)", proc.stdout)
         self.assertIn("does not evaluate", proc.stdout)
 
-    def test_warns_outside_cli_version_window(self) -> None:
+    def test_warns_below_minimum_cli_version(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
-        stale_bin = write_cli_bin(
-            self.base / "stale-bin", {**FAKE_CLI_SCRIPTS, "claude": "echo 9.9.9"}
+        old_bin = write_cli_bin(
+            self.base / "old-bin", {**FAKE_CLI_SCRIPTS, "claude": 'echo "2.1.231 (Claude Code)"'}
         )
         proc = run_core(
             ["verify"],
             repo,
-            extra_env={"PATH": f"{stale_bin}:{os.environ['PATH']}"},
+            extra_env={"PATH": f"{old_bin}:{os.environ['PATH']}"},
         )
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("outside the live-verified window", proc.stdout)
+        self.assertIn("WARN: claude 2.1.231 is below 2.1.232", proc.stdout)
 
-    def test_accepts_current_live_verified_cli_versions(self) -> None:
+    def test_accepts_newer_cli_versions_without_warning(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
-        current_bin = write_cli_bin(
-            self.base / "current-bin",
+        newer_bin = write_cli_bin(
+            self.base / "newer-bin",
             {
-                "claude": 'echo "2.1.252 (Claude Code)"',
-                "codex": "echo codex-cli 0.152.0",
+                "claude": 'echo "9.9.9 (Claude Code)"',
+                "codex": "echo codex-cli 9.9.9",
                 "kiro-cli": (
                     'if [ "$1" = "settings" ] && [ "$2" = "list" ]; then\n'
                     '  printf \'%s\\n\' \'{"chat.disableInheritingDefaultResources": false}\'\n'
                     "  exit 0\n"
                     "fi\n"
-                    "echo 2.20.2"
+                    "echo 9.9.9"
                 ),
             },
         )
         proc = run_core(
             ["verify"],
             repo,
-            extra_env={"PATH": f"{current_bin}:{os.environ['PATH']}"},
+            extra_env={"PATH": f"{newer_bin}:{os.environ['PATH']}"},
         )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-        self.assertNotIn("outside the live-verified window", proc.stdout)
+        self.assertNotIn("is below", proc.stdout)
+        self.assertNotIn("could not determine", proc.stdout)
 
     def codex_home_with(self, config: str) -> dict:
         home = self.base / "codex-home"

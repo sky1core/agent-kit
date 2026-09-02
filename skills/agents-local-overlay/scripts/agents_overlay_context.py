@@ -54,9 +54,10 @@ GENERATED_LOCAL_OWNER = (
 )
 
 NOTICE_PREFIX = "[agents-local-overlay] "
-# Live-verified (Claude 2.1.252): only built-in Explore and Plan start without
-# native CLAUDE.md memory; every other subagent inherits it, so injecting there
-# duplicates the rules. A custom agent named Explore/Plan is indistinguishable.
+# Claude docs (sub-agents, "Manage subagent context"): Explore and Plan are the
+# only subagents that omit CLAUDE.md; every other subagent inherits it, so
+# injecting there duplicates the rules. A custom agent named Explore/Plan is
+# indistinguishable.
 SUBAGENTS_WITHOUT_NATIVE_MEMORY = frozenset({"Explore", "Plan"})
 CLAUDE_MAX_CHARS = 10000
 CODEX_MAX_CHARS = 32768
@@ -72,10 +73,10 @@ KIRO_FALSE_REMEDIATION = (
 )
 KIRO_VERIFY_REFUSAL = f"could not verify Kiro settings; {KIRO_FALSE_REMEDIATION}"
 
-CLI_VERSION_WINDOWS = {
-    "claude": ((2, 1, 232), (2, 1, 252)),
-    "codex": ((0, 147, 0), (0, 152, 0)),
-    "kiro-cli": ((2, 15, 1), (2, 20, 2)),
+CLI_MIN_VERSIONS = {
+    "claude": (2, 1, 232),
+    "codex": (0, 147, 0),
+    "kiro-cli": (2, 15, 1),
 }
 
 
@@ -1037,7 +1038,7 @@ def parse_cli_version(text: str) -> Optional[Tuple[int, int, int]]:
 
 def cli_version_warnings() -> List[str]:
     warnings: List[str] = []
-    for name, (low, high) in CLI_VERSION_WINDOWS.items():
+    for name, low in CLI_MIN_VERSIONS.items():
         binary = shutil.which(name)
         if not binary:
             continue
@@ -1055,13 +1056,12 @@ def cli_version_warnings() -> List[str]:
         version = parse_cli_version(proc.stdout.decode("utf-8", "replace"))
         if version is None:
             warnings.append(f"could not determine {name} version")
-        elif not (low <= version <= high):
+        elif version < low:
             pretty = ".".join(str(part) for part in version)
             low_s = ".".join(str(part) for part in low)
-            high_s = ".".join(str(part) for part in high)
             warnings.append(
-                f"{name} {pretty} is outside the live-verified window "
-                f"{low_s}..{high_s}; re-run the live canary before relying on it"
+                f"{name} {pretty} is below {low_s}, the earliest version this skill "
+                "was verified on; the CLI interfaces it relies on may be missing"
             )
     return warnings
 
