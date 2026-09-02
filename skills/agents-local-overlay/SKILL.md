@@ -19,7 +19,8 @@ source를 native와 hook 사이에서 동적으로 전환하지 않는다.
 | CLI 컨텍스트 | `AGENTS.md` (공용) | `AGENTS.local.md` (로컬) |
 |---|---|---|
 | Claude 메인 세션 | native: commit된 `CLAUDE.md` → `@AGENTS.md` bridge | native: primary는 `CLAUDE.local.md` → `@AGENTS.local.md` bridge, 그 외 worktree는 hook이 갱신하는 생성 복사본 `CLAUDE.local.md` |
-| Claude subagent (fork 제외) | hook 주입 (subagent는 native memory를 받지 않음) | hook 주입 |
+| Claude subagent — built-in `Explore`·`Plan` | hook 주입 (이 둘만 native memory를 받지 않음) | hook 주입 |
+| Claude subagent — general-purpose·custom·plugin·fork | native (메인 세션의 project·local memory를 상속) | native |
 | Codex 세션·subagent | native: project doc 로더 | hook 주입 |
 | Kiro v3 | native: default-resource 채널 | launcher가 생성하는 steering 문서 |
 
@@ -166,13 +167,23 @@ done
 - `SessionStart` hook은 rule을 주입하지 않는다. primary 밖 worktree의 생성
   복사본을 원본과 동기화하고, 전제조건이 깨졌을 때만 notice를 넣는다. resume
   에서도 같은 hook이 복사본을 갱신한다.
-- `SubagentStart`는 `agent_type=fork`면 부모 context를 상속하므로 아무것도
-  하지 않고, 그 외에는 공용·로컬 snapshot을 주입한다. 주입 예산은 합산
+- `SubagentStart`는 `agent_type`이 built-in `Explore`·`Plan`일 때만 공용·로컬
+  snapshot을 주입한다. 이 둘만 native memory를 받지 않기 때문이다.
+  general-purpose·custom·plugin·fork subagent는 메인 세션의 project·local
+  memory를 native로 상속하므로 주입하지 않는다(주입 시 중복). 주입 예산은 합산
   10,000자이며 넘으면 rule 대신 notice가 들어가고 `verify`가 실패한다.
-- custom subagent 이름으로 `fork`를 쓰지 않는다. hook 입력만으로 built-in
-  fork와 구분할 수 없다.
+- custom subagent 이름으로 `Explore`·`Plan`을 쓰지 않는다. hook 입력의
+  `agent_type`만으로 built-in과 구분할 수 없어, 이 두 이름은 memory-less
+  built-in으로 취급한다.
 - `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1`은 native 채널을 끄므로 지원하지 않는다.
   설정돼 있으면 hook이 notice만 낸다.
+- 일반 Claude 설정(`~/.claude/settings.json`, repo `.claude/settings.json`,
+  `.claude/settings.local.json`)의 두 key가 채널을 조용히 끊는다: `disableAllHooks`가
+  true면 subagent 주입·session notice hook 자체가 안 뜨고, `claudeMdExcludes`가
+  `CLAUDE.md`/`CLAUDE.local.md` bridge 경로를 매칭하면 native bridge가 로드에서
+  빠진다. 둘 다 런타임 hook으로는 잡히지 않으므로 `verify`가 세 계층 설정을
+  읽어 해당 시 FAIL한다. managed/policy 설정과 one-session `--settings`는
+  보증 밖이다.
 - `claude-worktree-create`는 Claude `--worktree`의 기본 nested 배치를 primary
   밖의 git worktree로 바꾸고 생성 복사본까지 만든다. 기본 위치는
   `$HOME/.cache/agents-local-overlay/claude-worktrees/<repo>-<hash>/<name>`,

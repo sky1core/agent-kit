@@ -22,6 +22,8 @@ MODULE_ROOT = Path(MODULE_TMP.name)
 FAKE_BIN = MODULE_ROOT / "bin"
 EMPTY_CODEX_HOME = MODULE_ROOT / "codex-home"
 EMPTY_CODEX_HOME.mkdir()
+EMPTY_HOME = MODULE_ROOT / "home"
+EMPTY_HOME.mkdir()
 
 FAKE_CLI_SCRIPTS = {
     "claude": 'echo "2.1.235 (Claude Code)"',
@@ -57,6 +59,7 @@ def isolated_env(extra: dict | None = None) -> dict:
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_SYSTEM"] = "/dev/null"
     env["CODEX_HOME"] = str(EMPTY_CODEX_HOME)
+    env["HOME"] = str(EMPTY_HOME)
     env["PATH"] = f"{FAKE_BIN}:{env['PATH']}"
     if extra:
         env.update(extra)
@@ -250,6 +253,60 @@ class VerifyTests(OverlayTestCase):
         proc = run_core(["verify"], repo)
         self.assertEqual(proc.returncode, 1)
         self.assertIn("worktrees must not nest", proc.stdout)
+
+    @staticmethod
+    def _write_claude_settings(repo: Path, data: dict, local: bool = False) -> None:
+        d = repo / ".claude"
+        d.mkdir(exist_ok=True)
+        name = "settings.local.json" if local else "settings.json"
+        (d / name).write_text(json.dumps(data), encoding="utf-8")
+
+    def test_fails_on_disable_all_hooks(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        self._write_claude_settings(repo, {"disableAllHooks": True})
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("disableAllHooks is true", proc.stdout)
+
+    def test_fails_when_claude_md_excludes_shared_bridge(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        self._write_claude_settings(repo, {"claudeMdExcludes": ["**/CLAUDE.md"]})
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("claudeMdExcludes matches", proc.stdout)
+        self.assertIn("CLAUDE.md", proc.stdout)
+
+    def test_fails_when_claude_md_excludes_local_bridge(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        self._write_claude_settings(
+            repo, {"claudeMdExcludes": ["**/CLAUDE.local.md"]}, local=True
+        )
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("claudeMdExcludes matches", proc.stdout)
+        self.assertIn("CLAUDE.local.md", proc.stdout)
+
+    def test_ok_when_claude_md_excludes_unrelated_path(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        self._write_claude_settings(
+            repo, {"claudeMdExcludes": ["**/somewhere-else/CLAUDE.md"]}
+        )
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+
+    def test_ignores_claude_settings_in_non_overlay_repo(self) -> None:
+        # A plain repo with no shared/local source has no overlay Claude channel,
+        # so a global disableAllHooks must not produce a finding.
+        repo = self.base / "plain"
+        repo.mkdir()
+        run_git(repo, "init", "-q")
+        self._write_claude_settings(repo, {"disableAllHooks": True})
+        proc = run_core(["verify"], repo)
+        self.assertNotIn("disableAllHooks", proc.stdout)
 
     def test_warns_outside_cli_version_window(self) -> None:
         repo = make_repo(self.base)
@@ -565,9 +622,34 @@ class ClaudeSubagentHookTests(OverlayTestCase):
         self.assertIn("shared rule X", context)
         self.assertIn("local rule Y", context)
 
+    def test_plan_injects_like_explore(self) -> None:
+        repo = make_repo(self.base)
+        proc = run_core(CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="Plan"))
+        context = hook_context(proc)
+        self.assertIn("shared rule X", context)
+        self.assertIn("local rule Y", context)
+
     def test_fork_is_silent(self) -> None:
         repo = make_repo(self.base)
         proc = run_core(CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="fork"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_general_purpose_is_silent(self) -> None:
+        # general-purpose receives native project + local memory, so injecting
+        # would duplicate the rules.
+        repo = make_repo(self.base)
+        proc = run_core(
+            CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="general-purpose")
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
+
+    def test_custom_subagent_is_silent(self) -> None:
+        repo = make_repo(self.base)
+        proc = run_core(
+            CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="my-custom-agent")
+        )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
 
