@@ -7,9 +7,8 @@ One delivery channel per logical rule source per CLI context, fixed statically:
   AGENTS.local.md via CLAUDE.local.md (primary worktree: one-line bridge
   import; other worktrees: generated content copy refreshed by the
   SessionStart hook before native memory is read).
-- Claude subagent: the built-in Explore and Plan subagents start without native
-  memory, so the SubagentStart hook injects the shared+local snapshot for them
-  only; every other subagent inherits the main session's project+local memory.
+- Claude subagent: no overlay hook context is injected. Claude's SubagentStart
+  context channel is `additionalContext`, which this overlay avoids.
 - Codex: AGENTS.md via the native project doc loader; AGENTS.local.md via the
   SessionStart/SubagentStart hook.
 - Kiro: AGENTS.md via the native default-resource channel; AGENTS.local.md via
@@ -54,12 +53,6 @@ GENERATED_LOCAL_OWNER = (
 )
 
 NOTICE_PREFIX = "[agents-local-overlay] "
-# Claude docs (sub-agents, "Manage subagent context"): Explore and Plan are the
-# only subagents that omit CLAUDE.md; every other subagent inherits it, so
-# injecting there duplicates the rules. A custom agent named Explore/Plan is
-# indistinguishable.
-SUBAGENTS_WITHOUT_NATIVE_MEMORY = frozenset({"Explore", "Plan"})
-CLAUDE_MAX_CHARS = 10000
 CODEX_MAX_CHARS = 32768
 KIRO_MAX_CHARS = 32768
 CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES = 32768
@@ -72,6 +65,7 @@ KIRO_FALSE_REMEDIATION = (
     f"run: kiro-cli settings {KIRO_INHERITANCE_SETTING} false"
 )
 KIRO_VERIFY_REFUSAL = f"could not verify Kiro settings; {KIRO_FALSE_REMEDIATION}"
+KIRO_SETTINGS_TIMEOUT_SECONDS = 30
 
 CLI_MIN_VERSIONS = {
     "claude": (2, 1, 232),
@@ -568,7 +562,12 @@ def notice_lines(notices: Sequence[str]) -> str:
     return "\n".join(NOTICE_PREFIX + notice for notice in notices)
 
 
-def emit_json(event: str, body: str) -> None:
+def emit_plain_context(body: str) -> None:
+    sys.stdout.write(body + "\n")
+    sys.stdout.flush()
+
+
+def emit_additional_context_json(event: str, body: str) -> None:
     payload = {
         "hookSpecificOutput": {
             "hookEventName": event,
@@ -661,36 +660,11 @@ def claude_session_command(event: str, hook: dict) -> int:
     ctx = resolve_context(hook_cwd(hook, "claude-session"))
     notices = claude_session_notices(ctx)
     if notices:
-        emit_json(event, notice_lines(notices))
+        emit_plain_context(notice_lines(notices))
     return 0
 
 
 def claude_subagent_command(event: str, hook: dict) -> int:
-    agent_type = hook.get("agent_type")
-    if not isinstance(agent_type, str):
-        emit_json(
-            event,
-            notice_lines(["SubagentStart payload has no string agent_type; rules not injected"]),
-        )
-        return 0
-    if agent_type not in SUBAGENTS_WITHOUT_NATIVE_MEMORY:
-        return 0
-    ctx = resolve_context(hook_cwd(hook, "claude-subagent"))
-    notices: List[str] = missing_shared_notices(ctx) + stray_local_notices(ctx)
-    parts: List[Tuple[str, str]] = []
-    shared_text = read_optional_rule(shared_source_path(ctx), notices)
-    if shared_text is not None:
-        parts.append((SHARED_RULE, shared_text))
-    local_text = read_optional_rule(local_source_path(ctx), notices)
-    if local_text is not None:
-        parts.append((LOCAL_RULE, local_text))
-    body = labeled_rules(parts) if parts else ""
-    if body and len(body) > CLAUDE_MAX_CHARS:
-        notices.append(over_cap_notice("claude-subagent", CLAUDE_MAX_CHARS))
-        body = ""
-    pieces = [piece for piece in (notice_lines(notices), body) if piece]
-    if pieces:
-        emit_json(event, "\n\n".join(pieces))
     return 0
 
 
@@ -750,7 +724,7 @@ def codex_hook_command(event: str, hook: dict, policy: str) -> int:
     ctx = resolve_context(hook_cwd(hook, policy))
     if not path_exists(local_source_path(ctx)):
         if stray_local_notices(ctx):
-            emit_json(event, notice_lines(codex_kiro_precondition_notices(ctx)))
+            emit_additional_context_json(event, notice_lines(codex_kiro_precondition_notices(ctx)))
         return 0
     notices = codex_kiro_precondition_notices(ctx)
     local_text = read_optional_rule(local_source_path(ctx), notices)
@@ -760,7 +734,7 @@ def codex_hook_command(event: str, hook: dict, policy: str) -> int:
         body = ""
     pieces = [piece for piece in (notice_lines(notices), body) if piece]
     if pieces:
-        emit_json(event, "\n\n".join(pieces))
+        emit_additional_context_json(event, "\n\n".join(pieces))
     return 0
 
 
@@ -779,7 +753,7 @@ def kiro_inheritance_refusal(cwd: Optional[Path] = None, fix: bool = False) -> s
                 cwd=str(cwd) if cwd is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=10,
+                timeout=KIRO_SETTINGS_TIMEOUT_SECONDS,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -806,7 +780,7 @@ def kiro_inheritance_refusal(cwd: Optional[Path] = None, fix: bool = False) -> s
                 cwd=str(cwd) if cwd is not None else None,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                timeout=10,
+                timeout=KIRO_SETTINGS_TIMEOUT_SECONDS,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -1127,11 +1101,16 @@ def claude_md_excluded(patterns: Sequence[str], path: Path) -> Tuple[bool, List[
     return False, unevaluable
 
 
-CLAUDE_SETTINGS_LAYERS = (
-    ("user", None),
-    ("project", ".claude/settings.json"),
-    ("local", ".claude/settings.local.json"),
-)
+CLAUDE_CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+CLAUDE_PROJECT_SETTINGS = ".claude/settings.json"
+CLAUDE_LOCAL_SETTINGS = ".claude/settings.local.json"
+
+
+def claude_config_dir() -> Path:
+    configured = os.environ.get(CLAUDE_CONFIG_DIR_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".claude"
 
 
 def read_claude_settings(path: Path, problems: List[str]) -> Optional[dict]:
@@ -1152,19 +1131,66 @@ def read_claude_settings(path: Path, problems: List[str]) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
+def containing_checkout_worktree(ctx: RepoContext, path: Path) -> Optional[Path]:
+    for worktree in ctx.checkout_worktrees:
+        if path_is_within(path, worktree):
+            return worktree
+    return None
+
+
+def claude_session_dirs(ctx: RepoContext) -> Tuple[Path, ...]:
+    """Directories verify treats as Claude session starts: the directory it was
+    given plus every checkout worktree root."""
+    return tuple(dict.fromkeys((ctx.start, *ctx.checkout_worktrees)))
+
+
+def claude_local_settings_root(ctx: RepoContext, worktree: Path) -> Path:
+    # Claude reads settings.local.json at the main checkout's root, also from a
+    # linked worktree. A bare root has no main checkout, so each worktree root
+    # is used instead.
+    return worktree if ctx.root_is_bare else ctx.root
+
+
+def claude_settings_layers(
+    ctx: RepoContext,
+    session_dir: Path,
+    worktree: Path,
+    user_layer: Tuple[str, Path, Optional[dict]],
+    problems: List[str],
+) -> List[Tuple[str, Path, Optional[dict]]]:
+    # Lowest to highest precedence. Project settings come from the session's
+    # primary working directory with no parent fallback. The local file comes
+    # from the checkout root; a file left in the starting directory is still
+    # read, with the root's values winning.
+    layers = [user_layer]
+    project_path = session_dir / CLAUDE_PROJECT_SETTINGS
+    layers.append(("project", project_path, read_claude_settings(project_path, problems)))
+    local_root = claude_local_settings_root(ctx, worktree)
+    if session_dir != local_root:
+        legacy_path = session_dir / CLAUDE_LOCAL_SETTINGS
+        layers.append(("local", legacy_path, read_claude_settings(legacy_path, problems)))
+    root_local_path = local_root / CLAUDE_LOCAL_SETTINGS
+    layers.append(("local", root_local_path, read_claude_settings(root_local_path, problems)))
+    return layers
+
+
 def claude_settings_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
     problems: List[str] = []
     warnings: List[str] = []
-    user_path = Path.home() / ".claude" / "settings.json"
-    user = read_claude_settings(user_path, problems)
+    user_path = claude_config_dir() / "settings.json"
+    user_layer = ("user", user_path, read_claude_settings(user_path, problems))
     seen: set = set()
-    for worktree in ctx.checkout_worktrees:
-        layers = [("user", user_path, user)]
-        for name, rel in CLAUDE_SETTINGS_LAYERS:
-            if rel is None:
-                continue
-            p = worktree / rel
-            layers.append((name, p, read_claude_settings(p, problems)))
+
+    def add_problem(msg: str) -> None:
+        if msg not in seen:
+            seen.add(msg)
+            problems.append(msg)
+
+    for session_dir in claude_session_dirs(ctx):
+        worktree = containing_checkout_worktree(ctx, session_dir)
+        if worktree is None:
+            continue
+        layers = claude_settings_layers(ctx, session_dir, worktree, user_layer, problems)
 
         # disableAllHooks: last layer (highest precedence) that sets it wins.
         disable_source: Optional[Path] = None
@@ -1174,14 +1200,11 @@ def claude_settings_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
                 disable_value = data.get("disableAllHooks")
                 disable_source = p
         if disable_value is True:
-            msg = (
+            add_problem(
                 f"disableAllHooks is true in {disable_source}; Claude hooks are off, "
-                "so this overlay's subagent injection and session notices will not "
+                "so this overlay's session notices and worktree hooks will not "
                 "run — re-enable hooks"
             )
-            if msg not in seen:
-                seen.add(msg)
-                problems.append(msg)
 
         # claudeMdExcludes: arrays merge across layers.
         patterns: List[str] = []
@@ -1198,25 +1221,50 @@ def claude_settings_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
                 continue
             matched, unevaluable = claude_md_excluded(patterns, bridge)
             if matched:
-                msg = (
+                add_problem(
                     f"claudeMdExcludes matches {bridge}; Claude will not load that "
                     "bridge, so the rules it carries are silently dropped — remove "
                     "the matching pattern"
                 )
-                if msg not in seen:
-                    seen.add(msg)
-                    problems.append(msg)
             elif unevaluable:
-                msg = (
+                add_problem(
                     "claudeMdExcludes pattern(s) "
                     + ", ".join(repr(p) for p in unevaluable)
                     + " use brace, character-class, extglob or negation syntax this "
-                    f"check does not evaluate; confirm they do not match {bridge}"
+                    f"check cannot evaluate, so it cannot prove {bridge} still loads "
+                    "— rewrite them with absolute paths or **, * and ? globs"
                 )
-                if msg not in seen:
-                    seen.add(msg)
-                    warnings.append(msg)
     return problems, warnings
+
+
+CODEX_PROJECT_CONFIG = ".codex/config.toml"
+CODEX_PROJECT_DOC_KEYS = ("project_doc_max_bytes", "project_doc_fallback_filenames")
+
+
+def read_toml(path: Path, problems: List[str]) -> Optional[dict]:
+    try:
+        return tomllib.loads(read_regular_file_bytes(path).decode("utf-8"))
+    except (OverlayError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        problems.append(f"could not parse {path}: {exc}")
+        return None
+
+
+def codex_trust_level(projects: object, worktree: Path) -> Optional[str]:
+    if not isinstance(projects, dict):
+        return None
+    for key in (str(worktree), str(resolved_or_self(worktree))):
+        entry = projects.get(key)
+        if isinstance(entry, dict):
+            level = entry.get("trust_level")
+            return level if isinstance(level, str) else None
+    return None
+
+
+def codex_project_config_chain(worktree: Path, session_dir: Path) -> List[Path]:
+    # Codex layers .codex/config.toml from the project root down to cwd; a
+    # deeper file overrides a shallower one.
+    parts = session_dir.relative_to(worktree).parts
+    return [worktree.joinpath(*parts[:depth]) for depth in range(len(parts) + 1)]
 
 
 def codex_verify_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
@@ -1234,26 +1282,74 @@ def codex_verify_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
     if tomllib is None:
         warnings.append("python tomllib unavailable; Codex config not checked")
         return problems, warnings
-    try:
-        data = tomllib.loads(read_regular_file_bytes(config_path).decode("utf-8"))
-    except (OverlayError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        problems.append(f"could not parse {config_path}: {exc}")
+    data = read_toml(config_path, problems)
+    if data is None:
         return problems, warnings
-    fallback = data.get("project_doc_fallback_filenames")
-    if fallback not in (None, []):
-        problems.append(
-            f"{config_path}: project_doc_fallback_filenames must be [] or absent"
-        )
     if "project_root_markers" in data:
         problems.append(
             f"{config_path}: project_root_markers changes Codex project-doc "
             "discovery; remove it"
         )
-    max_bytes = data.get("project_doc_max_bytes", CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES)
-    if not isinstance(max_bytes, int) or max_bytes <= 0:
-        problems.append(f"{config_path}: project_doc_max_bytes must be a positive integer")
-    else:
-        for worktree in ctx.checkout_worktrees:
+    user_doc_settings = {
+        key: (data[key], config_path) for key in CODEX_PROJECT_DOC_KEYS if key in data
+    }
+    projects = data.get("projects")
+    seen: set = set()
+
+    def add_problem(msg: str) -> None:
+        if msg not in seen:
+            seen.add(msg)
+            problems.append(msg)
+
+    for worktree in ctx.checkout_worktrees:
+        level = codex_trust_level(projects, worktree)
+        if level == "untrusted":
+            add_problem(
+                f"{worktree} is untrusted in {config_path}; Codex does not load "
+                f"{SHARED_RULE} for untrusted projects — set trust_level = "
+                '"trusted" for it'
+            )
+            continue
+        if level != "trusted":
+            warnings.append(
+                f"{worktree} has no trusted entry in {config_path}; Codex ignores "
+                f"its {CODEX_PROJECT_CONFIG} until the path is trusted, so this "
+                "check evaluated only the user config"
+            )
+        session_dirs = [worktree]
+        if ctx.start != worktree and path_is_within(ctx.start, worktree):
+            session_dirs.append(ctx.start)
+        for session_dir in session_dirs:
+            doc_settings = dict(user_doc_settings)
+            if level == "trusted":
+                for directory in codex_project_config_chain(worktree, session_dir):
+                    project_config = directory / CODEX_PROJECT_CONFIG
+                    if not path_exists(project_config):
+                        continue
+                    project_data = read_toml(project_config, problems)
+                    if project_data is None:
+                        continue
+                    if "project_root_markers" in project_data:
+                        add_problem(
+                            f"{project_config}: project_root_markers changes Codex "
+                            "project-doc discovery; remove it"
+                        )
+                    for key in CODEX_PROJECT_DOC_KEYS:
+                        if key in project_data:
+                            doc_settings[key] = (project_data[key], project_config)
+            fallback, fallback_source = doc_settings.get(
+                "project_doc_fallback_filenames", (None, config_path)
+            )
+            if fallback not in (None, []):
+                add_problem(
+                    f"{fallback_source}: project_doc_fallback_filenames must be [] or absent"
+                )
+            max_bytes, max_source = doc_settings.get(
+                "project_doc_max_bytes", (CODEX_DEFAULT_PROJECT_DOC_MAX_BYTES, config_path)
+            )
+            if not isinstance(max_bytes, int) or max_bytes <= 0:
+                add_problem(f"{max_source}: project_doc_max_bytes must be a positive integer")
+                continue
             shared = worktree / SHARED_RULE
             if not path_exists(shared):
                 continue
@@ -1262,30 +1358,10 @@ def codex_verify_findings(ctx: RepoContext) -> Tuple[List[str], List[str]]:
             except OverlayError:
                 continue
             if size > max_bytes:
-                problems.append(
+                add_problem(
                     f"{shared} is {size} bytes, over Codex project_doc_max_bytes "
-                    f"{max_bytes}; Codex would truncate the shared rules"
+                    f"{max_bytes} from {max_source}; Codex would truncate the shared rules"
                 )
-    projects = data.get("projects")
-    if isinstance(projects, dict):
-        trusted = {
-            key
-            for key, value in projects.items()
-            if isinstance(value, dict) and value.get("trust_level") == "trusted"
-        }
-        for worktree in ctx.checkout_worktrees:
-            candidates = {str(worktree), str(resolved_or_self(worktree))}
-            if not candidates & trusted:
-                warnings.append(
-                    f"{worktree} has no trusted entry in {config_path}; Codex may "
-                    "skip native AGENTS.md loading for untrusted projects"
-                )
-    else:
-        for worktree in ctx.checkout_worktrees:
-            warnings.append(
-                f"{worktree} has no trusted entry in {config_path}; Codex may "
-                "skip native AGENTS.md loading for untrusted projects"
-            )
     return problems, warnings
 
 
@@ -1403,20 +1479,6 @@ def verify_command(argv: Sequence[str]) -> int:
             except OverlayError as exc:
                 problems.append(str(exc))
 
-    budget_cases = list(shared_texts.items()) if shared_texts else [(None, None)]
-    for worktree, worktree_shared in budget_cases:
-        parts = [(SHARED_RULE, worktree_shared)] if worktree_shared is not None else []
-        if local_text is not None:
-            parts.append((LOCAL_RULE, local_text))
-        if not parts:
-            continue
-        combined = labeled_rules(parts)
-        if len(combined) > CLAUDE_MAX_CHARS:
-            where = f" with {worktree / SHARED_RULE}" if worktree is not None else ""
-            problems.append(
-                f"combined rules{where} are {len(combined)} chars, over the "
-                f"{CLAUDE_MAX_CHARS}-char Claude subagent hook budget; shorten them"
-            )
     if local_text is not None:
         body = labeled_rules([(LOCAL_RULE, local_text)])
         if len(body) > CODEX_MAX_CHARS:
@@ -1437,10 +1499,7 @@ def verify_command(argv: Sequence[str]) -> int:
     if shutil.which("kiro-cli") is not None:
         refusal = kiro_inheritance_refusal(ctx.top)
         if refusal:
-            if "is true" in refusal or "must be boolean" in refusal:
-                problems.append(f"kiro: {refusal}")
-            else:
-                warnings.append(f"kiro: {refusal}")
+            warnings.append(f"kiro experimental: {refusal}")
     for worktree in ctx.checkout_worktrees:
         for parent_rel in (".kiro", ".kiro/steering"):
             parent = worktree / parent_rel

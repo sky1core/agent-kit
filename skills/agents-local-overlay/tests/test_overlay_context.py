@@ -127,6 +127,10 @@ def hook_context(proc: subprocess.CompletedProcess) -> str:
     return payload["hookSpecificOutput"]["additionalContext"]
 
 
+def hook_stdout_context(proc: subprocess.CompletedProcess) -> str:
+    return proc.stdout
+
+
 CLAUDE_SESSION = ["json", "SessionStart", "CLAUDE.md", "CLAUDE.local.md", ".", "claude-session"]
 CLAUDE_SUBAGENT = ["json", "SubagentStart", "CLAUDE.md", "CLAUDE.local.md", ".", "claude-subagent"]
 CODEX_SESSION = ["json", "SessionStart", "AGENTS.md", "-", ".", "codex-session"]
@@ -401,16 +405,80 @@ class VerifyTests(OverlayTestCase):
             proc = run_core(["verify"], repo)
             self.assertEqual(proc.returncode, expected, f"{pattern}: {proc.stdout}")
 
-    def test_warns_on_unevaluable_claude_md_excludes_pattern(self) -> None:
+    def test_fails_on_unevaluable_claude_md_excludes_pattern(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
         self._write_claude_settings(
             repo, {"claudeMdExcludes": ["**/CLAUDE.{md,local.md}"]}
         )
         proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("FAIL: claudeMdExcludes pattern(s)", proc.stdout)
+        self.assertIn("cannot evaluate", proc.stdout)
+        self.assertNotIn("WARN: claudeMdExcludes", proc.stdout)
+
+    def test_reads_user_settings_from_claude_config_dir(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        config_dir = self.base / "claude-config"
+        config_dir.mkdir()
+        (config_dir / "settings.json").write_text(
+            json.dumps({"disableAllHooks": True}), encoding="utf-8"
+        )
+        env = self._user_home_with_claude_settings({"disableAllHooks": False})
+        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"disableAllHooks is true in {config_dir / 'settings.json'}", proc.stdout)
+
+    def test_main_root_local_settings_apply_to_linked_worktree(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        worktree = self.add_worktree(repo)
+        self.setup_repo(worktree)
+        self._write_claude_settings(
+            repo, {"claudeMdExcludes": [f"{worktree}/CLAUDE.local.md"]}, local=True
+        )
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"claudeMdExcludes matches {worktree}/CLAUDE.local.md", proc.stdout)
+
+    def test_main_root_local_settings_win_in_linked_worktree(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        worktree = self.add_worktree(repo)
+        self.setup_repo(worktree)
+        self._write_claude_settings(worktree, {"disableAllHooks": True}, local=True)
+        proc = run_core(["verify"], worktree)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"disableAllHooks is true in {worktree / '.claude/settings.local.json'}", proc.stdout)
+        self._write_claude_settings(repo, {"disableAllHooks": False}, local=True)
+        proc = run_core(["verify"], worktree)
         self.assertEqual(proc.returncode, 0, proc.stdout)
-        self.assertIn("WARN: claudeMdExcludes pattern(s)", proc.stdout)
-        self.assertIn("does not evaluate", proc.stdout)
+
+    def test_project_settings_are_read_from_start_directory(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        sub = repo / "sub"
+        sub.mkdir()
+        self._write_claude_settings(sub, {"disableAllHooks": True})
+        proc = run_core(["verify"], repo)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        proc = run_core(["verify"], sub)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"disableAllHooks is true in {sub / '.claude/settings.json'}", proc.stdout)
+
+    def test_root_local_settings_win_over_start_directory_local_settings(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        sub = repo / "sub"
+        sub.mkdir()
+        self._write_claude_settings(sub, {"disableAllHooks": True}, local=True)
+        proc = run_core(["verify"], sub)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self._write_claude_settings(repo, {"disableAllHooks": False}, local=True)
+        proc = run_core(["verify"], sub)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
 
     def test_warns_below_minimum_cli_version(self) -> None:
         repo = make_repo(self.base)
@@ -490,7 +558,95 @@ class VerifyTests(OverlayTestCase):
         self.setup_repo(repo)
         proc = run_core(["verify"], repo, extra_env=self.codex_home_with(""))
         self.assertEqual(proc.returncode, 0)
-        self.assertIn("no trusted entry", proc.stdout)
+        self.assertIn("WARN", proc.stdout)
+        self.assertIn("has no trusted entry", proc.stdout)
+
+    def codex_trust_toml(self, repo: Path, level: str, extra: str = "") -> str:
+        return f'{extra}[projects."{repo}"]\ntrust_level = "{level}"\n'
+
+    def test_fails_on_explicit_codex_untrusted(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        proc = run_core(
+            ["verify"], repo, extra_env=self.codex_home_with(self.codex_trust_toml(repo, "untrusted"))
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"FAIL: {repo} is untrusted", proc.stdout)
+        self.assertNotIn("has no trusted entry", proc.stdout)
+
+    def _write_codex_project_config(self, directory: Path, body: str) -> Path:
+        (directory / ".codex").mkdir(exist_ok=True)
+        path = directory / ".codex" / "config.toml"
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def test_trusted_project_codex_config_overrides_doc_cap(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        project_config = self._write_codex_project_config(repo, "project_doc_max_bytes = 8\n")
+        env = self.codex_home_with(
+            self.codex_trust_toml(repo, "trusted", "project_doc_max_bytes = 32768\n")
+        )
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"over Codex project_doc_max_bytes 8 from {project_config}", proc.stdout)
+
+    def test_trusted_project_codex_config_fallback_filenames_fail(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        project_config = self._write_codex_project_config(
+            repo, 'project_doc_fallback_filenames = ["X.md"]\n'
+        )
+        env = self.codex_home_with(self.codex_trust_toml(repo, "trusted"))
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"FAIL: {project_config}: project_doc_fallback_filenames", proc.stdout)
+
+    def test_trusted_project_codex_config_root_markers_fail(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        project_config = self._write_codex_project_config(
+            repo, 'project_root_markers = [".git"]\n'
+        )
+        env = self.codex_home_with(self.codex_trust_toml(repo, "trusted"))
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"FAIL: {project_config}: project_root_markers", proc.stdout)
+
+    def test_project_codex_config_ignored_without_trust(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        self._write_codex_project_config(repo, "project_doc_max_bytes = 8\n")
+        proc = run_core(["verify"], repo, extra_env=self.codex_home_with(""))
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("has no trusted entry", proc.stdout)
+
+    def test_deeper_project_codex_config_applies_to_start_directory(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        sub = repo / "sub"
+        sub.mkdir()
+        self._write_codex_project_config(repo, "project_doc_max_bytes = 32768\n")
+        deeper = self._write_codex_project_config(sub, "project_doc_max_bytes = 8\n")
+        env = self.codex_home_with(self.codex_trust_toml(repo, "trusted"))
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        proc = run_core(["verify"], sub, extra_env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"from {deeper}", proc.stdout)
+
+    def test_deeper_project_codex_config_root_markers_fail(self) -> None:
+        repo = make_repo(self.base)
+        self.setup_repo(repo)
+        sub = repo / "sub"
+        sub.mkdir()
+        deeper = self._write_codex_project_config(sub, 'project_root_markers = [".git"]\n')
+        env = self.codex_home_with(self.codex_trust_toml(repo, "trusted"))
+        proc = run_core(["verify"], repo, extra_env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        proc = run_core(["verify"], sub, extra_env=env)
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn(f"FAIL: {deeper}: project_root_markers", proc.stdout)
 
     def test_fails_when_worktree_lacks_shared_source(self) -> None:
         repo = self.base / "repo"
@@ -515,7 +671,7 @@ class VerifyTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn(f"{worktree} has no AGENTS.md", proc.stdout)
 
-    def test_fails_on_kiro_inheritance_true(self) -> None:
+    def test_warns_on_kiro_inheritance_true(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
         true_bin = write_cli_bin(
@@ -532,8 +688,9 @@ class VerifyTests(OverlayTestCase):
         proc = run_core(
             ["verify"], repo, extra_env={"PATH": f"{true_bin}:{os.environ['PATH']}"}
         )
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("FAIL: kiro:", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertIn("WARN: kiro experimental:", proc.stdout)
+        self.assertNotIn("FAIL: kiro:", proc.stdout)
 
     def test_fails_on_invalid_shared_source_in_other_worktree(self) -> None:
         repo = make_ignored_shared_repo(self.base)
@@ -584,15 +741,15 @@ class VerifyTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn(f"{worktree / 'AGENTS.override.md'} replaces AGENTS.md", proc.stdout)
 
-    def test_fails_when_other_worktree_shared_exceeds_claude_budget(self) -> None:
+    def test_allows_large_shared_rule_without_claude_subagent_budget(self) -> None:
         repo = make_ignored_shared_repo(self.base)
         self.setup_repo(repo)
         worktree = self.add_worktree(repo)
         (worktree / "AGENTS.md").write_text("z" * 10500 + "\n", encoding="utf-8")
+        self.setup_repo(worktree)
         proc = run_core(["verify"], repo)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("Claude subagent hook budget", proc.stdout)
-        self.assertIn(str(worktree / "AGENTS.md"), proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertNotIn("Claude subagent hook budget", proc.stdout)
 
     def test_fails_on_foreign_steering_in_other_worktree(self) -> None:
         repo = make_repo(self.base)
@@ -631,14 +788,14 @@ class VerifyTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 1)
         self.assertIn("local source lives in the primary worktree only", proc.stdout)
 
-    def test_fails_when_combined_rules_exceed_claude_budget(self) -> None:
+    def test_allows_combined_rules_without_claude_subagent_budget(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
         (repo / "AGENTS.md").write_text("x" * 9000 + "\n", encoding="utf-8")
         (repo / "AGENTS.local.md").write_text("y" * 2000 + "\n", encoding="utf-8")
         proc = run_core(["verify"], repo)
-        self.assertEqual(proc.returncode, 1)
-        self.assertIn("Claude subagent hook budget", proc.stdout)
+        self.assertEqual(proc.returncode, 0, proc.stdout)
+        self.assertNotIn("Claude subagent hook budget", proc.stdout)
 
 
 class ClaudeSessionHookTests(OverlayTestCase):
@@ -685,7 +842,7 @@ class ClaudeSessionHookTests(OverlayTestCase):
         (repo / "AGENTS.local.md").symlink_to(repo / "AGENTS.md")
         proc = run_core(CLAUDE_SESSION, worktree, stdin=hook_stdin(worktree))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("symlink", hook_context(proc))
+        self.assertIn("symlink", hook_stdout_context(proc))
         copy = worktree / "CLAUDE.local.md"
         self.assertTrue(copy.exists())
         self.assertIn("local rule Y", copy.read_text(encoding="utf-8"))
@@ -701,7 +858,7 @@ class ClaudeSessionHookTests(OverlayTestCase):
         shutil.move(str(worktree), str(moved))
         proc = run_core(CLAUDE_SESSION, moved, stdin=hook_stdin(moved))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        context = hook_context(proc)
+        context = hook_stdout_context(proc)
         self.assertIn("not in git worktree list", context)
         self.assertIn("git worktree repair", context)
 
@@ -714,8 +871,8 @@ class ClaudeSessionHookTests(OverlayTestCase):
         run_git(repo, "worktree", "add", "-q", str(nested))
         proc = run_core(CLAUDE_SESSION, nested, stdin=hook_stdin(nested))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertIn("Rules may be duplicated", hook_context(proc))
-        self.assertIn("nests with worktree", hook_context(proc))
+        self.assertIn("Rules may be duplicated", hook_stdout_context(proc))
+        self.assertIn("nests with worktree", hook_stdout_context(proc))
 
     def test_notice_when_native_channel_disabled(self) -> None:
         repo = make_repo(self.base)
@@ -726,14 +883,14 @@ class ClaudeSessionHookTests(OverlayTestCase):
             stdin=hook_stdin(repo),
             extra_env={"CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1"},
         )
-        self.assertIn("CLAUDE_CODE_DISABLE_CLAUDE_MDS", hook_context(proc))
+        self.assertIn("CLAUDE_CODE_DISABLE_CLAUDE_MDS", hook_stdout_context(proc))
 
     def test_notice_when_shared_bridge_missing(self) -> None:
         repo = make_repo(self.base)
         self.setup_repo(repo)
         (repo / "CLAUDE.md").unlink()
         proc = run_core(CLAUDE_SESSION, repo, stdin=hook_stdin(repo))
-        self.assertIn("CLAUDE.md bridge is missing", hook_context(proc))
+        self.assertIn("CLAUDE.md bridge is missing", hook_stdout_context(proc))
 
     def test_notice_on_foreign_copy_in_worktree(self) -> None:
         repo = make_repo(self.base)
@@ -743,7 +900,7 @@ class ClaudeSessionHookTests(OverlayTestCase):
         worktree = self.add_worktree(repo)
         (worktree / "CLAUDE.local.md").write_text("my own notes\n", encoding="utf-8")
         proc = run_core(CLAUDE_SESSION, worktree, stdin=hook_stdin(worktree))
-        self.assertIn("not overlay-generated", hook_context(proc))
+        self.assertIn("not overlay-generated", hook_stdout_context(proc))
         self.assertEqual(
             (worktree / "CLAUDE.local.md").read_text(encoding="utf-8"), "my own notes\n"
         )
@@ -763,19 +920,17 @@ class ClaudeSessionHookTests(OverlayTestCase):
 
 
 class ClaudeSubagentHookTests(OverlayTestCase):
-    def test_injects_shared_and_local(self) -> None:
+    def test_explore_is_silent(self) -> None:
         repo = make_repo(self.base)
         proc = run_core(CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="Explore"))
-        context = hook_context(proc)
-        self.assertIn("shared rule X", context)
-        self.assertIn("local rule Y", context)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
-    def test_plan_injects_like_explore(self) -> None:
+    def test_plan_is_silent(self) -> None:
         repo = make_repo(self.base)
         proc = run_core(CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="Plan"))
-        context = hook_context(proc)
-        self.assertIn("shared rule X", context)
-        self.assertIn("local rule Y", context)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
     def test_fork_is_silent(self) -> None:
         repo = make_repo(self.base)
@@ -801,39 +956,34 @@ class ClaudeSubagentHookTests(OverlayTestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")
 
-    def test_missing_agent_type_emits_notice_only(self) -> None:
+    def test_missing_agent_type_is_silent(self) -> None:
         repo = make_repo(self.base)
         for stdin in (hook_stdin(repo), hook_stdin(repo, agent_type=["Explore"])):
             proc = run_core(CLAUDE_SUBAGENT, repo, stdin=stdin)
             self.assertEqual(proc.returncode, 0, proc.stderr)
-            context = hook_context(proc)
-            self.assertIn("no string agent_type", context)
-            self.assertNotIn("shared rule X", context)
+            self.assertEqual(proc.stdout, "")
 
-    def test_over_cap_replaces_body_with_notice(self) -> None:
+    def test_over_cap_is_silent(self) -> None:
         repo = make_repo(self.base)
         (repo / "AGENTS.md").write_text("x" * 11000 + "\n", encoding="utf-8")
         proc = run_core(CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="Explore"))
-        context = hook_context(proc)
-        self.assertIn("Rules not injected", context)
-        self.assertNotIn("xxxx", context)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
-    def test_notices_missing_shared_in_worktree(self) -> None:
+    def test_missing_shared_in_worktree_is_silent(self) -> None:
         repo = make_ignored_shared_repo(self.base)
         worktree = self.add_worktree(repo)
         proc = run_core(CLAUDE_SUBAGENT, worktree, stdin=hook_stdin(worktree, agent_type="Explore"))
-        context = hook_context(proc)
-        self.assertIn("has no AGENTS.md", context)
-        self.assertIn("local rule Y", context)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
-    def test_invalid_local_keeps_healthy_shared(self) -> None:
+    def test_invalid_local_is_silent(self) -> None:
         repo = make_repo(self.base)
         (repo / "AGENTS.local.md").unlink()
         (repo / "AGENTS.local.md").symlink_to(repo / "AGENTS.md")
         proc = run_core(CLAUDE_SUBAGENT, repo, stdin=hook_stdin(repo, agent_type="Explore"))
-        context = hook_context(proc)
-        self.assertIn("is a symlink", context)
-        self.assertIn("shared rule X", context)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "")
 
 
 class CodexHookTests(OverlayTestCase):
