@@ -147,6 +147,7 @@ done
 
 ```json
 {
+  "totalTokensReminder": "off",
   "hooks": {
     "SessionStart": [
       {
@@ -182,6 +183,11 @@ done
 }
 ```
 
+- `totalTokensReminder`는 `"off"`를 권장한다. overlay rule 전달의 필수조건은
+  아니어서 `verify` 실패 조건은 아니지만, 세션마다 변하는 token reminder가
+  Claude prompt cache prefix를 흔드는 경로를 피하기 위한 비용 안정화 설정이다.
+  이 설정을 `CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS` 같은 모델·버전별 beta
+  env와 섞지 않는다. beta env는 이 스킬의 권장 설정이 아니다.
 - `SessionStart` hook은 rule을 주입하지 않는다. primary 밖 worktree의 생성
   복사본을 원본과 동기화하고, 전제조건이 깨졌을 때만 notice를 넣는다. resume
   에서도 같은 hook이 복사본을 갱신한다.
