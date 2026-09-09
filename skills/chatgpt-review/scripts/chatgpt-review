@@ -109,6 +109,31 @@ class Browser:
         self.config = config
         self.deadline = time.monotonic() + timeout
         self.phase = '시작'
+        self.record = None
+        self.next_action = 'inspect'
+
+    @contextlib.contextmanager
+    def error_context(self):
+        try:
+            yield
+        except (ReviewError, OSError, ValueError, KeyError) as exc:
+            error = exc if isinstance(exc, ReviewError) else ReviewError(str(exc), code='local_error')
+            if error.details['phase'] is None:
+                error.details['phase'] = self.phase
+            if self.record is not None:
+                if error.details['request_id'] is None and 'request_id' in self.record:
+                    error.details['request_id'] = self.record['request_id']
+                if error.details['status'] == 'blocked' and 'status' in self.record:
+                    error.details['status'] = self.record['status']
+            if error.details['code'] in ('review_error', 'local_error', 'orca_timeout', 'orca_error'):
+                error.details['next_action'] = self.next_action
+            if error is exc:
+                raise
+            raise error from exc
+
+    def save_record(self, path, record, create=False):
+        save_json(path, record, create=create)
+        self.record = dict(record)
 
     def command(self, *args):
         command = [self.config['orca'], *args, '--page', self.config['page'], '--json']
@@ -141,7 +166,7 @@ class Browser:
                 capture_output=True, text=True, timeout=min(30, remaining),
             )
         except subprocess.TimeoutExpired as exc:
-            raise ReviewError('Orca 응답 시간 초과. 전송 결과가 불확실하면 collect를 사용하세요.') from exc
+            raise ReviewError('Orca 응답 시간 초과.', code='orca_timeout') from exc
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
@@ -329,7 +354,7 @@ class Browser:
             raise ReviewError('브라우저 세션이 바뀌어 재시도할 수 없습니다. collect를 사용하세요.')
         record['browser_scope'] = scope
         record['status'] = 'send_attempted'
-        save_json(record_path, record)
+        self.save_record(record_path, record)
 
     def paste_guarded(self, prompt):
         return self.data(self.paste_expression(prompt))
@@ -409,12 +434,15 @@ class Browser:
         self.open_model_menu()
         self.model_options()
         self.stage_dispatch(record, record_path)
+        self.phase = 'dispatch'
+        self.next_action = 'collect'
         result = self.submit_guarded(prompt, record['model'], record['effort'], record['request_id'], record['browser_scope'])
         if not result['sent']:
             if result.get('uncertain', False):
                 raise ReviewError('전송 여부 확인 필요: ' + result['reason'] + '. collect를 사용하세요.')
+            self.next_action = 'inspect'
             record['last_rejection'] = result['reason']
-            save_json(record_path, record)
+            self.save_record(record_path, record)
             raise ReviewError('전송 차단: ' + result['reason'])
         self.remember_conversation(record, record_path)
 
@@ -430,7 +458,7 @@ class Browser:
             record['conversation'] = state['url']
             if record['status'] == 'needs_manual_recovery':
                 record['status'] = 'send_attempted'
-            save_json(record_path, record)
+            self.save_record(record_path, record)
             return True
         try:
             self.wait(locate, '전송된 대화 주소 저장')
@@ -438,15 +466,17 @@ class Browser:
             if exc.details['code'] != 'review_error':
                 raise
             record['status'] = 'needs_manual_recovery'
-            save_json(record_path, record)
+            self.save_record(record_path, record)
             raise ReviewError('전송된 대화를 찾지 못했습니다. 확인한 URL로 collect --conversation을 실행하세요.',
                               code='needs_manual_recovery', phase='locate', status='needs_manual_recovery',
                               request_id=record['request_id'], next_action='collect_with_conversation') from exc
 
     def bind_conversation(self, record, record_path, url):
         self.validate_conversation_url(url)
-        self.open_conversation(url)
         state = self.state()
+        if state['url'] != url:
+            self.open_conversation(url)
+            state = self.state()
         if state['url'] != url or state['work'] or request_index(state, record) is None:
             raise ReviewError('지정한 대화에서 동일한 요청을 확인하지 못했습니다.', code='request_not_found',
                               phase='recover', status='needs_manual_recovery', request_id=record['request_id'],
@@ -454,7 +484,7 @@ class Browser:
         record['conversation'] = url
         if record['status'] == 'needs_manual_recovery':
             record['status'] = 'send_attempted'
-        save_json(record_path, record)
+        self.save_record(record_path, record)
 
     def collect(self, record, record_path, reopen_after):
         previous = None
@@ -490,7 +520,7 @@ class Browser:
                 if (not state['busy'] and reopen_after > 0 and record['reopen_attempts'] == 0
                         and time.monotonic() - progress_since >= reopen_after):
                     record['reopen_attempts'] = 1
-                    save_json(record_path, record)
+                    self.save_record(record_path, record)
                     self.reopen(record)
                     progress = None
                     progress_since = time.monotonic()
@@ -647,7 +677,7 @@ def main():
     if args.timeout <= 0:
         raise ReviewError('--timeout은 양수여야 합니다.')
     browser = Browser(config, args.timeout)
-    with page_lock(config['page']):
+    with browser.error_context(), page_lock(config['page']):
         if args.command == 'models':
             browser.project()
             browser.open_model_menu()
@@ -662,6 +692,8 @@ def main():
         if output.exists():
             if args.command == 'collect' and record_path.is_file():
                 record = json.loads(record_path.read_text())
+                browser.record = dict(record)
+                browser.phase = 'recover'
                 if record['project'] != config['project'] or record['page'] != config['page']:
                     raise ReviewError('기록된 프로젝트/탭이 현재 설정과 다릅니다.')
                 if args.conversation and args.conversation != record.get('conversation'):
@@ -669,8 +701,9 @@ def main():
                 if record['status'] in ('answer_ready', 'completed') and 'answer_sha256' in record:
                     if hashlib.sha256(output.read_bytes()).hexdigest() != record['answer_sha256']:
                         raise ReviewError('저장된 답변 파일이 변경됐습니다. 덮어쓰지 않습니다.')
+                    browser.next_action = 'collect'
                     record['status'] = 'completed'
-                    save_json(record_path, record)
+                    browser.save_record(record_path, record)
                     print(json.dumps(result_json(output, record_path, record), ensure_ascii=False))
                     return
             raise ReviewError('출력 파일이 이미 있습니다. 덮어쓰지 않습니다.')
@@ -680,10 +713,14 @@ def main():
             previous_record = None
             if record_path.exists():
                 previous_record = json.loads(record_path.read_text())
+                browser.record = dict(previous_record)
+                if previous_record['status'] != 'prepared':
+                    browser.next_action = 'collect'
                 if previous_record['status'] == 'send_attempted':
                     receipt = browser.dispatch_receipt(previous_record)
                     if receipt is not None:
                         raise ReviewError('이미 전송을 시도한 요청입니다. collect를 사용하세요.')
+                    browser.next_action = 'inspect'
                     if previous_record['model'] != args.model or previous_record['effort'] != args.effort:
                         raise ReviewError('미확인 요청 재시도에서는 기존 모델/성능을 유지해야 합니다.')
                 elif previous_record['status'] != 'prepared':
@@ -706,14 +743,21 @@ def main():
                       'reopen_attempts': 0}
             if previous_record is not None and previous_record['status'] == 'send_attempted':
                 record = previous_record
+            if previous_record is None:
+                browser.record = {'request_id': request_id}
+            browser.phase = 'prepare'
             scope = record['browser_scope'] if record['status'] == 'send_attempted' else '0' * 36
             browser.validate_request_size(prompt, args.model, args.effort, request_id, scope)
-            save_json(record_path, record, create=previous_record is None)
+            browser.save_record(record_path, record, create=previous_record is None)
             browser.project(prompt)
             record['selection'] = browser.select_model(args.model, args.effort)
             browser.send(prompt, record, record_path)
         else:
             record = json.loads(record_path.read_text())
+            browser.record = dict(record)
+            browser.phase = 'recover'
+            if record['status'] in ('send_attempted', 'answer_ready', 'needs_manual_recovery'):
+                browser.next_action = 'collect'
             if record['project'] != config['project'] or record['page'] != config['page']:
                 raise ReviewError('요청 기록과 현재 설정의 프로젝트/탭이 다릅니다.')
             if record['status'] not in ('send_attempted', 'answer_ready', 'needs_manual_recovery'):
@@ -726,7 +770,7 @@ def main():
                 browser.remember_conversation(record, record_path)
             if args.reopen:
                 record['reopen_attempts'] += 1
-                save_json(record_path, record)
+                browser.save_record(record_path, record)
             if args.reopen or browser.state()['url'] != record['conversation']:
                 browser.reopen(record)
         answer, url, response_model, message_id = browser.collect(record, record_path, args.reopen_after)
@@ -735,10 +779,10 @@ def main():
             raise ReviewError('이전에 회수한 응답과 메시지 ID가 다릅니다.')
         record.update(status='answer_ready', conversation=url, response_model=response_model, message_id=message_id,
                       answer_sha256=hashlib.sha256(content.encode()).hexdigest())
-        save_json(record_path, record)
+        browser.save_record(record_path, record)
         save_answer(output, content)
         record['status'] = 'completed'
-        save_json(record_path, record)
+        browser.save_record(record_path, record)
         print(json.dumps(result_json(output, record_path, record), ensure_ascii=False))
 
 

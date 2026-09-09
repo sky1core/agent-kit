@@ -157,3 +157,124 @@ with patch('os.sysconf', return_value=1024):
     else:
         raise AssertionError('environment and argv limit ignored')
 print('답변 상태·오류 귀속·연속 완료 판정·무응답 재열기·복구 검증·직렬화 바이트 제한: 통과')
+
+with tempfile.TemporaryDirectory() as folder:
+    checkpoint = Path(folder) / 'request.json'
+    busy_state = dict(state, busy=True, editor='', editor_plain='', pending_tiles=0)
+    browser = Browser(config, 30)
+    browser.state = lambda: busy_state
+    browser.call = lambda *args: (_ for _ in ()).throw(AssertionError('unexpected navigation'))
+    pending = dict(record, status='needs_manual_recovery')
+    del pending['conversation']
+    browser.bind_conversation(pending, checkpoint, url)
+    assert pending['status'] == 'send_attempted' and pending['conversation'] == url
+    before = checkpoint.read_bytes()
+    browser.state = lambda: dict(busy_state, messages=[dict(user, text=prompt + ' changed')])
+    try:
+        browser.bind_conversation(pending, checkpoint, url)
+    except ReviewError as exc:
+        assert exc.details['code'] == 'request_mismatch'
+    else:
+        raise AssertionError('same URL wrong request accepted')
+    assert checkpoint.read_bytes() == before
+    browser.state = lambda: dict(busy_state, url=url + '-other')
+    try:
+        browser.bind_conversation(pending, checkpoint, url)
+    except ReviewError:
+        pass
+    else:
+        raise AssertionError('navigation away from busy conversation accepted')
+
+import subprocess
+import sys
+
+with tempfile.TemporaryDirectory() as folder:
+    output = Path(folder) / 'answer.txt'
+    for failure_phase in ('prepare', 'dispatch'):
+        checkpoint = output.with_name(output.name + '.request.json')
+        if checkpoint.exists():
+            checkpoint.unlink()
+        initial = dict(state, url=config['project'], messages=[], editor=prompt,
+                       editor_plain=prompt, pending_tiles=0)
+        def prepare(browser, draft):
+            if failure_phase == 'prepare':
+                browser.call('eval', '--expression', '1')
+        def paste(browser, text):
+            initial['editor'] = initial['editor_plain'] = text
+            return {'pasted': True}
+        initial['editor'] = initial['editor_plain'] = ''
+        argv = ['chatgpt-review', '--config', 'fixture.json', 'ask', '--model', 'Model',
+                '--effort', '1', '--question', 'question', '--out', str(output)]
+        with patch.object(sys, 'argv', argv), patch.dict(module['main'].__globals__, {'load_config': lambda p: config}), \
+             patch.object(Browser, 'project', prepare), patch.object(Browser, 'select_model', lambda *a: {}), \
+             patch.object(Browser, 'state', lambda b: initial), patch.object(Browser, 'paste_guarded', paste), \
+             patch.object(Browser, 'expand_paste', lambda b: None), patch.object(Browser, 'wait', lambda *a: True), \
+             patch.object(Browser, 'open_model_menu', lambda b: None), patch.object(Browser, 'model_options', lambda b: []), \
+             patch.object(Browser, 'browser_scope', lambda b: 'fixture-scope'), \
+             patch('subprocess.run', side_effect=subprocess.TimeoutExpired('orca', 1)):
+            try:
+                module['main']()
+            except ReviewError as exc:
+                saved = json.loads(checkpoint.read_text())
+                assert exc.details['request_id'] == saved['request_id']
+                assert exc.details['phase'] == failure_phase
+                assert exc.details['status'] == saved['status']
+                assert exc.details['code'] == 'orca_timeout'
+                assert exc.details['next_action'] == ('collect' if failure_phase == 'dispatch' else 'inspect')
+            else:
+                raise AssertionError('timeout accepted')
+        assert not output.exists()
+print('동일 URL 생성 중 연결·해시 검증·다른 대화 보호·main 전송 전후 타임아웃 문맥: 통과')
+
+with tempfile.TemporaryDirectory() as folder:
+    checkpoint = Path(folder) / 'request.json'
+    for old_status, new_status in [('prepared', 'send_attempted'), ('answer_ready', 'completed')]:
+        browser = Browser(config, 30)
+        pending = dict(record, status=old_status)
+        browser.save_record(checkpoint, pending)
+        pending['status'] = new_status
+        with patch('os.replace', side_effect=OSError('injected replace failure')):
+            try:
+                with browser.error_context():
+                    browser.save_record(checkpoint, pending)
+            except ReviewError as exc:
+                assert exc.details['status'] == old_status
+                assert exc.details['status'] == json.loads(checkpoint.read_text())['status']
+            else:
+                raise AssertionError('save failure accepted')
+    output = Path(folder) / 'answer.txt'
+    checkpoint = output.with_name(output.name + '.request.json')
+    pending = dict(record, status='prepared', project=config['project'], page=config['page'])
+    module['save_json'](checkpoint, pending)
+    argv = ['chatgpt-review', '--config', 'fixture.json', 'collect', '--out', str(output)]
+    with patch.object(sys, 'argv', argv), patch.dict(module['main'].__globals__, {'load_config': lambda p: config}):
+        try:
+            module['main']()
+        except ReviewError as exc:
+            assert exc.details['status'] == 'prepared' and exc.details['next_action'] == 'inspect'
+        else:
+            raise AssertionError('unsubmitted request collected')
+print('저장 실패 시 확정 상태 유지·미전송 collect 반복 안내 차단: 통과')
+
+with tempfile.TemporaryDirectory() as folder:
+    output = Path(folder) / 'answer.txt'
+    output.write_text('answer\n')
+    checkpoint = output.with_name(output.name + '.request.json')
+    pending = dict(record, status='answer_ready', project=config['project'], page=config['page'],
+                   answer_sha256=module['hashlib'].sha256(output.read_bytes()).hexdigest())
+    module['save_json'](checkpoint, pending)
+    before = checkpoint.read_bytes()
+    argv = ['chatgpt-review', '--config', 'fixture.json', 'collect', '--out', str(output)]
+    with patch.object(sys, 'argv', argv), patch.dict(module['main'].__globals__, {'load_config': lambda p: config}), \
+         patch('os.replace', side_effect=OSError('injected replace failure')):
+        try:
+            module['main']()
+        except ReviewError as exc:
+            assert exc.details['status'] == 'answer_ready'
+            assert exc.details['next_action'] == 'collect'
+            assert exc.details['phase'] == 'recover'
+            assert exc.details['request_id'] == pending['request_id']
+        else:
+            raise AssertionError('completion save failure accepted')
+    assert checkpoint.read_bytes() == before and output.read_text() == 'answer\n'
+print('기존 답변 완료 기록 실패 시 collect 안내·파일 보존: 통과')
