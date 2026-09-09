@@ -108,6 +108,7 @@ with tempfile.TemporaryDirectory() as folder:
     browser.open_conversation = lambda value: None
     for observed, expected in [(dict(state, messages=[]), 'request_not_found'),
                                (dict(state, messages=[dict(user, text=prompt + ' changed')]), 'request_mismatch')]:
+        browser.deadline = module['time'].monotonic() + 5
         browser.state = lambda: observed
         try:
             browser.bind_conversation(pending, checkpoint, url)
@@ -116,6 +117,7 @@ with tempfile.TemporaryDirectory() as folder:
         else:
             raise AssertionError('invalid conversation linked')
         assert checkpoint.read_bytes() == before and 'conversation' not in pending
+    browser.deadline = module['time'].monotonic() + 5
     browser.state = lambda: state
     browser.bind_conversation(pending, checkpoint, url)
     assert pending['conversation'] == url and pending['status'] == 'send_attempted'
@@ -278,3 +280,63 @@ with tempfile.TemporaryDirectory() as folder:
             raise AssertionError('completion save failure accepted')
     assert checkpoint.read_bytes() == before and output.read_text() == 'answer\n'
 print('기존 답변 완료 기록 실패 시 collect 안내·파일 보존: 통과')
+
+with tempfile.TemporaryDirectory() as folder:
+    checkpoint = Path(folder) / 'loading.json'
+    for later, code in [(state, None), (dict(state, busy=True), None),
+                        (dict(state, work=True), 'conversation_changed'),
+                        (dict(state, url=url + '-other'), 'conversation_changed'),
+                        (dict(state, messages=[dict(user, text=prompt + ' changed')]), 'request_mismatch'),
+                        (dict(state, messages=[user, user]), 'duplicate_request'),
+                        (dict(state, messages=[]), 'request_not_found')]:
+        clock = Clock()
+        with patch('time.monotonic', clock.monotonic), patch('time.sleep', clock.sleep):
+            browser = Browser(config, 6)
+            pending = dict(record, status='needs_manual_recovery')
+            del pending['conversation']
+            browser.save_record(checkpoint, pending)
+            before = checkpoint.read_bytes()
+            reads = []
+            def loading_state():
+                reads.append(1)
+                return dict(state, messages=[]) if len(reads) == 1 else later
+            browser.state = loading_state
+            browser.call = lambda *args: (_ for _ in ()).throw(AssertionError('unexpected navigation or send'))
+            try:
+                browser.bind_conversation(pending, checkpoint, url)
+            except ReviewError as exc:
+                assert exc.details['code'] == code, exc.details
+                assert checkpoint.read_bytes() == before
+                assert 'conversation' not in pending
+                assert clock.now == (6 if code == 'request_not_found' else 0.5)
+            else:
+                assert code is None and len(reads) == 2 and clock.now == 0.5
+                assert pending['conversation'] == url
+print('동일 URL 초기 로딩 대기·생성 중 연결·경계 위반 즉시 차단·시간 제한·실패 시 기록 보존: 통과')
+
+with tempfile.TemporaryDirectory() as folder:
+    checkpoint = Path(folder) / 'tool-error.json'
+    for stdout in ('not JSON', '{"ok":false,"error":{"code":"fixture_failure"}}'):
+        clock = Clock()
+        with patch('time.monotonic', clock.monotonic), patch('time.sleep', clock.sleep):
+            browser = Browser(config, 6)
+            pending = dict(record, status='needs_manual_recovery')
+            del pending['conversation']
+            browser.save_record(checkpoint, pending)
+            before = checkpoint.read_bytes()
+            original_state = browser.state
+            calls = []
+            def failing_state():
+                calls.append(1)
+                return dict(state, messages=[]) if len(calls) == 1 else original_state()
+            browser.state = failing_state
+            with patch('subprocess.run', return_value=subprocess.CompletedProcess([], 0, stdout, '')):
+                try:
+                    browser.bind_conversation(pending, checkpoint, url)
+                except ReviewError as exc:
+                    assert exc.details['code'] == 'review_error'
+                    assert 'Orca' in str(exc) and '제한 시간' not in str(exc)
+                    assert clock.now == 0.5 and checkpoint.read_bytes() == before
+                else:
+                    raise AssertionError('tool failure accepted')
+print('로딩 폴링 중 Orca JSON·실행 오류 보존: 통과')

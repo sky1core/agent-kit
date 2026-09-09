@@ -195,7 +195,7 @@ class Browser:
     def state(self):
         return self.data(STATE_JS)
 
-    def wait(self, check, description):
+    def wait(self, check, description, *, timeout_code='review_error'):
         self.phase = description
         deadline = min(self.deadline, time.monotonic() + 25)
         while time.monotonic() < deadline:
@@ -203,7 +203,7 @@ class Browser:
             if value:
                 return value
             time.sleep(0.5)
-        raise ReviewError(f'시간 초과: {description}. 자동 재전송하지 않습니다.')
+        raise ReviewError(f'시간 초과: {description}. 자동 재전송하지 않습니다.', code=timeout_code)
 
     def click(self, role, name):
         selector = 'button' if role == 'button' else f'[role="{role}"]'
@@ -486,10 +486,24 @@ class Browser:
         if state['url'] != url:
             self.open_conversation(url)
             state = self.state()
-        if state['url'] != url or state['work'] or request_index(state, record) is None:
-            raise ReviewError('지정한 대화에서 동일한 요청을 확인하지 못했습니다.', code='request_not_found',
+        def poll():
+            nonlocal state
+            current = self.state() if state is None else state
+            state = None
+            if current['url'] != url or current['work']:
+                raise ReviewError('대상 대화에서 벗어났거나 Work 모드입니다.', code='conversation_changed',
+                                  phase='recover', status='needs_manual_recovery', request_id=record['request_id'],
+                                  next_action='inspect_conversation')
+            return request_index(current, record) is not None
+
+        try:
+            self.wait(poll, '복구할 요청 메시지 대기', timeout_code='request_wait_timeout')
+        except ReviewError as exc:
+            if exc.details['code'] != 'request_wait_timeout':
+                raise
+            raise ReviewError('제한 시간 안에 지정한 대화의 요청을 확인하지 못했습니다.', code='request_not_found',
                               phase='recover', status='needs_manual_recovery', request_id=record['request_id'],
-                              next_action='inspect_conversation')
+                              next_action='inspect_conversation') from exc
         record['conversation'] = url
         if record['status'] == 'needs_manual_recovery':
             record['status'] = 'send_attempted'
