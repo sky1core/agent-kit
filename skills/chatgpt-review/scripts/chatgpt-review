@@ -70,11 +70,20 @@ STATE_JS = r"""JSON.stringify((() => {
   const plain = n => n.nodeType === Node.TEXT_NODE ? n.nodeValue
     : n.nodeName === 'BR' ? (n.classList.contains('ProseMirror-trailingBreak') ? '' : '\n')
     : [...n.childNodes].map(plain).join('');
+  const messageText = e => {
+    if (e.getAttribute('data-message-author-role') !== 'user') return e.innerText;
+    const roots = e.querySelectorAll('[data-testid="collapsible-user-message-root"]');
+    if (!roots.length) return e.innerText;
+    const bodies = e.querySelectorAll('[data-testid="collapsible-user-message-content"]');
+    if (roots.length !== 1 || bodies.length !== 1) throw Error('user message body not unique');
+    return bodies[0].innerText;
+  };
   const responseErrors = [];
   let userText = null;
   for (const turn of main?.querySelectorAll('[data-turn]') || []) {
     if (turn.getAttribute('data-turn') === 'user') {
-      userText = turn.querySelector('[data-message-author-role="user"]')?.innerText ?? null;
+      const user = turn.querySelector('[data-message-author-role="user"]');
+      userText = user ? messageText(user) : null;
     } else if (turn.getAttribute('data-turn') === 'assistant' && userText !== null) {
       for (const alert of turn.querySelectorAll('[role="alert"]')) {
         if (alert.getClientRects().length && alert.innerText.trim())
@@ -95,7 +104,7 @@ STATE_JS = r"""JSON.stringify((() => {
       role: e.getAttribute('data-message-author-role'),
       model: e.getAttribute('data-message-model-slug'),
       id: e.getAttribute('data-message-id'),
-      text: e.innerText,
+      text: messageText(e),
       answer: [...e.querySelectorAll('.markdown')].map(n => n.innerText).join('\n\n'),
       complete: !!e.closest('[data-turn="assistant"]')?.querySelector('[data-testid="copy-turn-action-button"]')
     })),

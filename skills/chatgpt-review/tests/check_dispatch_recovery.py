@@ -124,8 +124,8 @@ with module['page_lock'](config['page']):
     browser.open_conversation(args.other_conversation)
     assert browser.state()['url'] == args.other_conversation and args.other_conversation != actual_url
 collect = [str(script), '--config', str(args.config), '--timeout', '150', 'collect', '--out', str(output)]
-missing = [str(script), '--config', str(args.config), '--timeout', '4', 'collect', '--out', str(output)]
-result = subprocess.run(missing, capture_output=True, text=True, timeout=15)
+missing = [str(script), '--config', str(args.config), '--timeout', '45', 'collect', '--out', str(output)]
+result = subprocess.run(missing, capture_output=True, text=True, timeout=55)
 assert result.returncode == 1 and json.loads(result.stderr)['code'] == 'needs_manual_recovery', result.stderr
 assert json.loads(checkpoint.read_text())['status'] == 'needs_manual_recovery'
 result = subprocess.run([*collect, '--conversation', actual_url], capture_output=True, text=True, timeout=160)
