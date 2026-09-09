@@ -16,7 +16,52 @@ import uuid
 
 
 class ReviewError(Exception):
-    pass
+    def __init__(self, message, *, code='review_error', phase=None, status='blocked',
+                 request_id=None, next_action='inspect'):
+        super().__init__(message)
+        self.details = dict(code=code, phase=phase, status=status,
+                            request_id=request_id, next_action=next_action)
+
+
+def prompt_digest(text):
+    return hashlib.sha256(text.strip().encode('utf-8')).hexdigest()
+
+
+def request_index(state, record):
+    marker = 'Request-ID: ' + record['request_id']
+    users = [i for i, message in enumerate(state['messages']) if message['role'] == 'user'
+             and message['text'].strip().split('\n', 1)[0] == marker]
+    if len(users) > 1:
+        raise ReviewError('동일 요청이 여러 번 발견됐습니다.', code='duplicate_request',
+                          request_id=record['request_id'])
+    if not users:
+        return None
+    index = users[0]
+    if prompt_digest(state['messages'][index]['text']) != record['prompt_sha256']:
+        raise ReviewError('Request-ID는 같지만 요청 본문 해시가 다릅니다.', code='request_mismatch',
+                          request_id=record['request_id'])
+    return index
+
+
+def response_observation(state, record):
+    index = request_index(state, record)
+    if index is None:
+        return {'status': 'unknown', 'text': '', 'id': None, 'model': None}
+    following = state['messages'][index + 1:]
+    if any(item['role'] == 'user' for item in following):
+        raise ReviewError('다른 질문이 추가됐습니다. 답변을 혼동하지 않도록 중단합니다.',
+                          code='conversation_changed', request_id=record['request_id'])
+    if any(error['user_text'] == state['messages'][index]['text'] for error in state['response_errors']):
+        return {'status': 'explicit_error', 'text': '', 'id': None, 'model': None}
+    answers = [item for item in following if item['role'] == 'assistant']
+    if len(answers) != 1:
+        status = 'generating' if state['busy'] else ('waiting' if not answers else 'unknown')
+        return {'status': status, 'text': '', 'id': None, 'model': None}
+    answer = answers[0]
+    status = 'generating' if state['busy'] else 'waiting'
+    if not state['busy'] and answer['answer'] and answer['complete'] and answer['id']:
+        status = 'complete'
+    return {'status': status, 'text': answer['answer'], 'id': answer['id'], 'model': answer['model']}
 
 
 STATE_JS = r"""JSON.stringify((() => {
@@ -25,6 +70,18 @@ STATE_JS = r"""JSON.stringify((() => {
   const plain = n => n.nodeType === Node.TEXT_NODE ? n.nodeValue
     : n.nodeName === 'BR' ? (n.classList.contains('ProseMirror-trailingBreak') ? '' : '\n')
     : [...n.childNodes].map(plain).join('');
+  const responseErrors = [];
+  let userText = null;
+  for (const turn of main?.querySelectorAll('[data-turn]') || []) {
+    if (turn.getAttribute('data-turn') === 'user') {
+      userText = turn.querySelector('[data-message-author-role="user"]')?.innerText ?? null;
+    } else if (turn.getAttribute('data-turn') === 'assistant' && userText !== null) {
+      for (const alert of turn.querySelectorAll('[role="alert"]')) {
+        if (alert.getClientRects().length && alert.innerText.trim())
+          responseErrors.push({user_text:userText, text:alert.innerText});
+      }
+    }
+  }
   return {
     url: location.origin + location.pathname,
     ready: document.readyState,
@@ -42,7 +99,7 @@ STATE_JS = r"""JSON.stringify((() => {
       answer: [...e.querySelectorAll('.markdown')].map(n => n.innerText).join('\n\n'),
       complete: !!e.closest('[data-turn="assistant"]')?.querySelector('[data-testid="copy-turn-action-button"]')
     })),
-    alerts: [...document.querySelectorAll('[role="alert"]')].map(e => e.innerText).filter(Boolean)
+    response_errors: responseErrors
   };
 })())"""
 
@@ -53,13 +110,34 @@ class Browser:
         self.deadline = time.monotonic() + timeout
         self.phase = '시작'
 
+    def command(self, *args):
+        command = [self.config['orca'], *args, '--page', self.config['page'], '--json']
+        sizes = [len(os.fsencode(arg)) + 1 for arg in command]
+        env_size = sum(len(os.fsencode(k)) + len(os.fsencode(v)) + 2 for k, v in os.environ.items())
+        overhead = 4096 + 8 * (len(command) + len(os.environ) + 2)
+        if max(sizes) > 120000 or sum(sizes) + env_size + overhead > os.sysconf('SC_ARG_MAX'):
+            raise ReviewError('Orca 명령행 바이트 한도를 초과했습니다. 질문 또는 파일 크기를 줄이세요.',
+                              code='request_too_large', phase='prepare', next_action='reduce_input')
+        return command
+
+    @staticmethod
+    def eval_expression(expression):
+        return ("(() => {const normalizeName = value => value.replace(/\\s+/g, ' ').trim(); "
+                "const uiName = element => normalizeName(element.getAttribute('aria-label') || element.innerText); return ("
+                + expression + ");})()")
+
+    def validate_request_size(self, prompt, model, effort, request_id, scope):
+        for expression in (self.paste_expression(prompt), self.submit_expression(prompt, model, effort, request_id, scope)):
+            self.command('eval', '--expression', self.eval_expression(expression))
+
     def call(self, *args):
+        command = self.command(*args)
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ReviewError('시간 초과. 자동으로 재전송하지 않습니다.')
         try:
             result = subprocess.run(
-                [self.config['orca'], *args, '--page', self.config['page'], '--json'],
+                command,
                 capture_output=True, text=True, timeout=min(30, remaining),
             )
         except subprocess.TimeoutExpired as exc:
@@ -75,7 +153,7 @@ class Browser:
         return data['result']
 
     def evaluate(self, expression):
-        return self.call('eval', '--expression', expression)['result']
+        return self.call('eval', '--expression', self.eval_expression(expression))['result']
 
     def data(self, expression):
         return json.loads(self.evaluate(expression))
@@ -98,7 +176,7 @@ class Browser:
         self.evaluate(r"""(() => {
           const nodes = [...document.querySelectorAll(""" + json.dumps(selector) + r""")]
             .filter(e => e.getClientRects().length && !e.closest('[role="menu"][data-state="closed"]') &&
-              (e.getAttribute('aria-label') || e.innerText).replace(/\s+/g, ' ').trim() === """ + json.dumps(name) + r""");
+              uiName(e) === normalizeName(""" + json.dumps(name) + ")" + r""");
           if (nodes.length !== 1) throw Error('UI target not unique');
           const e = nodes[0];
           e.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true,cancelable:true,button:0,pointerType:'mouse',isPrimary:true}));
@@ -168,7 +246,7 @@ class Browser:
         name = self.data(r"""JSON.stringify((() => {
           const buttons = [...document.querySelectorAll('main form button[aria-haspopup="menu"]')]
             .filter(e => !e.getAttribute('data-testid'));
-          return buttons.length === 1 ? buttons[0].innerText.replace(/\s+/g, ' ').trim() : null;
+          return buttons.length === 1 ? uiName(buttons[0]) : null;
         })())""")
         if not name:
             raise ReviewError('모델 메뉴 버튼을 식별하지 못했습니다.')
@@ -181,12 +259,15 @@ class Browser:
 
     def model_options(self):
         def options():
-            return self.data("JSON.stringify([...document.querySelectorAll('[role=menu][data-state=open] [role=menuitemradio]')].map(e => ({name:e.innerText.trim(),selected:e.getAttribute('aria-checked')==='true'})))")
+            return self.data("JSON.stringify([...document.querySelectorAll('[role=menu][data-state=open] [role=menuitemradio]')].map(e => ({name:uiName(e),selected:e.getAttribute('aria-checked')==='true'})))")
 
         items = options()
         if not items:
             self.click('menuitem', '모델 선택')
             items = self.wait(options, '모델 목록')
+        names = [item['name'] for item in items]
+        if len(names) != len(set(names)):
+            raise ReviewError('정규화한 모델 이름이 중복됩니다.', code='ambiguous_model')
         return items
 
     def select_model(self, model, effort):
@@ -251,8 +332,11 @@ class Browser:
         save_json(record_path, record)
 
     def paste_guarded(self, prompt):
-        expected = json.dumps({'project': self.config['project'], 'prompt': prompt})
-        return self.data("JSON.stringify((() => {const expected=" + expected + ";const state=JSON.parse(" + STATE_JS + r""");
+        return self.data(self.paste_expression(prompt))
+
+    def paste_expression(self, prompt):
+        expected = json.dumps({'project': self.config['project'], 'prompt': prompt}, ensure_ascii=False)
+        return "JSON.stringify((() => {const expected=" + expected + ";const state=JSON.parse(" + STATE_JS + r""");
           if (state.url !== expected.project || state.work || state.busy || state.messages.length || state.pending_tiles)
             return {pasted:false, reason:'project_or_chat_changed'};
           const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
@@ -261,12 +345,15 @@ class Browser:
           const data = new DataTransfer(); data.setData('text/plain', expected.prompt);
           editor.dispatchEvent(new ClipboardEvent('paste', {bubbles:true,cancelable:true,clipboardData:data}));
           return {pasted:true};
-        })())""")
+        })())"""
 
     def submit_guarded(self, prompt, model, effort, request_id, browser_scope):
+        return self.data(self.submit_expression(prompt, model, effort, request_id, browser_scope))
+
+    def submit_expression(self, prompt, model, effort, request_id, browser_scope):
         expected = json.dumps({'project': self.config['project'], 'prompt': prompt.strip(),
-                               'model': model, 'effort': effort, 'id': request_id, 'scope': browser_scope})
-        return self.data("JSON.stringify((() => {const expected = " + expected + ";const state = JSON.parse(" + STATE_JS + r""");
+                               'model': model, 'effort': effort, 'id': request_id, 'scope': browser_scope}, ensure_ascii=False)
+        return "JSON.stringify((() => {const expected = " + expected + ";const state = JSON.parse(" + STATE_JS + r""");
           const reject = reason => ({sent:false, reason});
           if (location.origin !== 'https://chatgpt.com' || sessionStorage.getItem('local-chat-review:scope') !== expected.scope)
             return {sent:false, reason:'session_changed', uncertain:true};
@@ -280,7 +367,7 @@ class Browser:
           const menus = document.querySelectorAll('[role="menu"][data-state="open"]');
           if (menus.length !== 1) return reject('model_menu_missing');
           const selected = [...menus[0].querySelectorAll('[role="menuitemradio"][aria-checked="true"]')];
-          if (selected.length !== 1 || selected[0].innerText.trim() !== expected.model)
+          if (selected.length !== 1 || uiName(selected[0]) !== normalizeName(expected.model))
             return reject('model_changed');
           const slider = menus[0].querySelector('[role="slider"]');
           if (!slider || Number(slider.getAttribute('aria-valuenow')) !== Number(slider.getAttribute('aria-valuemin')) + expected.effort - 1)
@@ -292,7 +379,7 @@ class Browser:
           buttons[0].click();
           sessionStorage.setItem(receiptKey, JSON.stringify({phase:'clicked', project:expected.project}));
           return {sent:true};
-        })())""")
+        })())"""
 
     def expand_paste(self):
         self.evaluate(r"""(() => {
@@ -334,61 +421,92 @@ class Browser:
     def remember_conversation(self, record, record_path):
         def locate():
             state = self.state()
-            matches = [m for m in state['messages'] if m['role'] == 'user' and record['request_id'] in m['text']]
-            if len(matches) == 1 and state['url'].startswith(self.config['project'].removesuffix('project') + 'c/'):
-                record['conversation'] = state['url']
-                save_json(record_path, record)
-                return True
-            return False
-        self.wait(locate, '전송된 대화 주소 저장')
+            prefix = self.config['project'].removesuffix('project') + 'c/'
+            if not state['url'].startswith(prefix) or state['work']:
+                return False
+            if request_index(state, record) is None:
+                return False
+            self.validate_conversation_url(state['url'])
+            record['conversation'] = state['url']
+            if record['status'] == 'needs_manual_recovery':
+                record['status'] = 'send_attempted'
+            save_json(record_path, record)
+            return True
+        try:
+            self.wait(locate, '전송된 대화 주소 저장')
+        except ReviewError as exc:
+            if exc.details['code'] != 'review_error':
+                raise
+            record['status'] = 'needs_manual_recovery'
+            save_json(record_path, record)
+            raise ReviewError('전송된 대화를 찾지 못했습니다. 확인한 URL로 collect --conversation을 실행하세요.',
+                              code='needs_manual_recovery', phase='locate', status='needs_manual_recovery',
+                              request_id=record['request_id'], next_action='collect_with_conversation') from exc
+
+    def bind_conversation(self, record, record_path, url):
+        self.validate_conversation_url(url)
+        self.open_conversation(url)
+        state = self.state()
+        if state['url'] != url or state['work'] or request_index(state, record) is None:
+            raise ReviewError('지정한 대화에서 동일한 요청을 확인하지 못했습니다.', code='request_not_found',
+                              phase='recover', status='needs_manual_recovery', request_id=record['request_id'],
+                              next_action='inspect_conversation')
+        record['conversation'] = url
+        if record['status'] == 'needs_manual_recovery':
+            record['status'] = 'send_attempted'
+        save_json(record_path, record)
 
     def collect(self, record, record_path, reopen_after):
         previous = None
         stable = 0
-        partial = None
-        partial_since = time.monotonic()
-        prefix = self.config['project'].removesuffix('project')
+        progress = None
+        progress_since = time.monotonic()
+        status = 'unknown'
+        self.phase = 'collect'
         while time.monotonic() < self.deadline:
             state = self.state()
-            if not state['url'].startswith(prefix) or state['work']:
-                raise ReviewError('대상 프로젝트에서 벗어났습니다. 자동 재전송하지 않습니다.')
-            users = [i for i, item in enumerate(state['messages'])
-                     if item['role'] == 'user' and record['request_id'] in item['text']]
-            if len(users) > 1:
-                raise ReviewError('동일 요청이 여러 번 발견됐습니다.')
-            if users:
-                if '/c/' in state['url'] and record.get('conversation') != state['url']:
-                    record['conversation'] = state['url']
+            if state['url'] != record['conversation'] or state['work']:
+                raise ReviewError('대상 대화에서 벗어났습니다. 자동 재전송하지 않습니다.',
+                                  code='conversation_changed', phase='collect', request_id=record['request_id'],
+                                  next_action='collect')
+            observation = response_observation(state, record)
+            status = observation['status']
+            if status == 'explicit_error':
+                raise ReviewError('해당 응답에 오류 알림이 있습니다. 대화를 확인하세요.',
+                                  code='response_error', phase='collect', status=status,
+                                  request_id=record['request_id'], next_action='inspect_conversation')
+            fingerprint = (observation['text'], observation['id'], observation['model'])
+            if fingerprint != progress or state['busy']:
+                progress = fingerprint
+                progress_since = time.monotonic()
+            if status == 'complete':
+                stable = stable + 1 if fingerprint == previous else 1
+                previous = fingerprint
+                if stable >= 2:
+                    return observation['text'], state['url'], observation['model'], observation['id']
+            else:
+                previous = None
+                stable = 0
+                if (not state['busy'] and reopen_after > 0 and record['reopen_attempts'] == 0
+                        and time.monotonic() - progress_since >= reopen_after):
+                    record['reopen_attempts'] = 1
                     save_json(record_path, record)
-                following = state['messages'][users[0] + 1:]
-                if any(item['role'] == 'user' for item in following):
-                    raise ReviewError('다른 질문이 추가됐습니다. 답변을 혼동하지 않도록 중단합니다.')
-                answers = [item for item in following if item['role'] == 'assistant']
-                if len(answers) == 1:
-                    answer = answers[0]
-                    text = answer['answer']
-                    if text != partial or state['busy']:
-                        partial = text
-                        partial_since = time.monotonic()
-                    if text and answer['complete'] and not state['busy']:
-                        stable = stable + 1 if text == previous else 1
-                        previous = text
-                        if stable >= 2:
-                            return text, state['url'], answer['model'], answer['id']
-                    elif not state['busy'] and reopen_after > 0 and record['reopen_attempts'] == 0 and time.monotonic() - partial_since >= reopen_after:
-                        record['reopen_attempts'] = 1
-                        save_json(record_path, record)
-                        self.reopen(record)
-                        previous = None
-                        stable = 0
-                        continue
+                    self.reopen(record)
+                    progress = None
+                    progress_since = time.monotonic()
+                    continue
             time.sleep(2)
-        raise ReviewError('답변 대기 시간 초과. 같은 --out으로 collect를 실행하면 재전송 없이 회수합니다.')
+        raise ReviewError('답변 대기 시간 초과. 같은 --out으로 collect를 실행하면 재전송 없이 회수합니다.',
+                          code='response_timeout', phase='collect', status=status,
+                          request_id=record['request_id'], next_action='collect')
 
-    def open_conversation(self, url):
+    def validate_conversation_url(self, url):
         prefix = self.config['project'].removesuffix('project') + 'c/'
         if not url.startswith(prefix) or not re.fullmatch(r'[a-zA-Z0-9-]+', url[len(prefix):]):
-            raise ReviewError('기록된 대화 주소가 대상 프로젝트에 속하지 않습니다.')
+            raise ReviewError('대화 주소가 대상 프로젝트에 속하지 않습니다.', code='invalid_conversation', phase='recover')
+
+    def open_conversation(self, url):
+        self.validate_conversation_url(url)
         self.project()
         self.call('goto', '--url', url)
 
@@ -407,31 +525,33 @@ class Browser:
 def save_json(path, value, create=False):
     fd, staging_name = tempfile.mkstemp(prefix=path.name + '.', suffix='.pending', dir=path.parent)
     staging = Path(staging_name)
-    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-        json.dump(value, stream, ensure_ascii=False, indent=2)
-        stream.write('\n')
-        stream.flush()
-        os.fsync(stream.fileno())
-    if create:
-        try:
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            json.dump(value, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        if create:
             os.link(staging, path)
-        finally:
+        else:
+            os.replace(staging, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
             staging.unlink()
-    else:
-        os.replace(staging, path)
 
 
 def save_answer(path, answer):
     fd, staging_name = tempfile.mkstemp(prefix=path.name + '.', suffix='.pending', dir=path.parent)
     staging = Path(staging_name)
-    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
-        stream.write(answer)
-        stream.flush()
-        os.fsync(stream.fileno())
     try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(answer)
+            stream.flush()
+            os.fsync(stream.fileno())
         os.link(staging, path)
     finally:
-        staging.unlink()
+        with contextlib.suppress(FileNotFoundError):
+            staging.unlink()
 
 
 def result_json(output, record_path, record):
@@ -439,14 +559,37 @@ def result_json(output, record_path, record):
             'model': record['model'], 'effort': record['effort'], 'conversation': record['conversation']}
 
 
-def file_part(path):
-    raw = path.read_bytes()
+def file_part(path, base_dir):
+    base = base_dir.expanduser().resolve()
+    resolved = path.expanduser().resolve()
+    try:
+        relative = resolved.relative_to(base)
+    except ValueError:
+        raise ReviewError('파일이 기준 디렉터리 밖에 있습니다.')
+    label = relative.as_posix()
+    if '\\' in label or any(ch < ' ' or ch == '\x7f' for ch in label):
+        raise ReviewError('파일 이름에 제어 문자나 역슬래시가 있습니다.')
+    raw = resolved.read_bytes()
     content = raw.decode('utf-8')
     if '\x00' in content:
-        raise ReviewError(f'텍스트 파일이 아닙니다: {path.name}')
-    payload = json.dumps({'file': path.name, 'content': content}, ensure_ascii=False)
+        raise ReviewError(f'텍스트 파일이 아닙니다: {label}')
+    payload = json.dumps({'file': label, 'content': content}, ensure_ascii=False)
     return ('파일 JSON (content의 JSON escape를 복원해 원문으로 읽으세요):\n' + payload,
-            {'name': path.name, 'sha256': hashlib.sha256(raw).hexdigest()})
+            {'name': label, 'sha256': hashlib.sha256(raw).hexdigest()})
+
+
+def prepare_files(paths, base_dir):
+    parts = []
+    file_infos = []
+    seen = set()
+    for path in paths:
+        part, info = file_part(path, base_dir)
+        if info['name'] in seen:
+            raise ReviewError(f"같은 파일을 여러 번 지정했습니다: {info['name']}")
+        seen.add(info['name'])
+        parts.append(part)
+        file_infos.append(info)
+    return parts, file_infos
 
 
 @contextlib.contextmanager
@@ -479,7 +622,7 @@ def load_config(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Orca의 일반 ChatGPT Chat을 제어합니다. LLM/API 호출 없이 파일 준비·모델 선택·전송·답변 저장을 수행합니다.')
+    parser = argparse.ArgumentParser(description='Orca의 일반 ChatGPT Chat을 제어합니다. 별도 LLM API를 직접 호출하지 않고 파일 준비·모델 선택·전송·답변 저장을 수행합니다.')
     parser.add_argument('--config', type=Path, required=True, help='개인 Orca 탭·프로젝트 설정 JSON 경로')
     parser.add_argument('--timeout', type=int, default=600, help='전체 실행 제한(초), 기본 600')
     subs = parser.add_subparsers(dest='command', required=True)
@@ -489,12 +632,14 @@ def main():
     ask.add_argument('--effort', type=int, choices=range(1, 6), required=True, help='화면 왼쪽부터 성능 단계 1~5')
     ask.add_argument('--question', required=True)
     ask.add_argument('--file', action='append', type=Path, default=[], help='UTF-8 텍스트 파일. 여러 번 지정 가능. JSON 문자열로 원문과 줄바꿈을 보존')
+    ask.add_argument('--base-dir', type=Path, default=Path.cwd(), help='파일 식별용 기준 디렉터리. 기본은 현재 디렉터리이며 그 밖의 파일은 거절')
     ask.add_argument('--max-chars', type=int, default=80000, help='합친 질문의 최대 문자 수(초과하면 전송 안 함)')
     ask.add_argument('--out', type=Path, required=True)
     ask.add_argument('--reopen-after', type=int, default=30, help='답변이 미완료 상태로 정지하면 지정 초 후 대화를 한 번 다시 열기. 기본 30, 0이면 사용 안 함. 재전송 없음')
     collect = subs.add_parser('collect', help='전송된 요청의 답변만 회수(재전송 없음)')
     collect.add_argument('--out', type=Path, required=True)
     collect.add_argument('--reopen', action='store_true', help='현재 요청의 저장된 대화 URL을 다시 열어 회수(재전송 없음)')
+    collect.add_argument('--conversation', help='Request-ID와 본문 해시를 검증한 뒤 연결할 같은 프로젝트의 대화 URL')
     collect.add_argument('--reopen-after', type=int, default=30, help='미완료 답변 정지 시 자동으로 한 번 다시 열기까지 초. 기본 30, 0이면 사용 안 함')
     args = parser.parse_args()
     os.umask(0o077)
@@ -519,6 +664,8 @@ def main():
                 record = json.loads(record_path.read_text())
                 if record['project'] != config['project'] or record['page'] != config['page']:
                     raise ReviewError('기록된 프로젝트/탭이 현재 설정과 다릅니다.')
+                if args.conversation and args.conversation != record.get('conversation'):
+                    raise ReviewError('저장된 답변의 대화 URL과 다릅니다.', code='conversation_changed', phase='recover')
                 if record['status'] in ('answer_ready', 'completed') and 'answer_sha256' in record:
                     if hashlib.sha256(output.read_bytes()).hexdigest() != record['answer_sha256']:
                         raise ReviewError('저장된 답변 파일이 변경됐습니다. 덮어쓰지 않습니다.')
@@ -545,15 +692,12 @@ def main():
                     raise ReviewError('기존 요청의 프로젝트/탭이 현재 설정과 다릅니다.')
             request_id = previous_record['request_id'] if previous_record is not None else 'LOCAL-REVIEW-' + uuid.uuid4().hex
             parts = [f'Request-ID: {request_id}', args.question]
-            files = []
-            for file in args.file:
-                part, file_info = file_part(file)
-                parts.append(part)
-                files.append(file_info)
+            file_parts, files = prepare_files(args.file, args.base_dir)
+            parts.extend(file_parts)
             prompt = '\n\n'.join(parts)
             if not args.question.strip() or len(prompt) > args.max_chars:
                 raise ReviewError('질문이 비어 있거나 --max-chars를 초과했습니다.')
-            digest = hashlib.sha256(prompt.encode()).hexdigest()
+            digest = prompt_digest(prompt)
             if previous_record is not None and previous_record['prompt_sha256'] != digest:
                 raise ReviewError('기존 요청과 질문/파일 내용이 다릅니다. 별도 --out을 지정하세요.')
             record = {'request_id': request_id, 'project': config['project'], 'page': config['page'],
@@ -562,6 +706,8 @@ def main():
                       'reopen_attempts': 0}
             if previous_record is not None and previous_record['status'] == 'send_attempted':
                 record = previous_record
+            scope = record['browser_scope'] if record['status'] == 'send_attempted' else '0' * 36
+            browser.validate_request_size(prompt, args.model, args.effort, request_id, scope)
             save_json(record_path, record, create=previous_record is None)
             browser.project(prompt)
             record['selection'] = browser.select_model(args.model, args.effort)
@@ -570,11 +716,13 @@ def main():
             record = json.loads(record_path.read_text())
             if record['project'] != config['project'] or record['page'] != config['page']:
                 raise ReviewError('요청 기록과 현재 설정의 프로젝트/탭이 다릅니다.')
-            if record['status'] not in ('send_attempted', 'answer_ready'):
+            if record['status'] not in ('send_attempted', 'answer_ready', 'needs_manual_recovery'):
                 raise ReviewError('전송 시도 기록이 없습니다.')
             if 'reopen_attempts' not in record:
                 record['reopen_attempts'] = 0
-            if 'conversation' not in record:
+            if args.conversation:
+                browser.bind_conversation(record, record_path, args.conversation)
+            elif 'conversation' not in record:
                 browser.remember_conversation(record, record_path)
             if args.reopen:
                 record['reopen_attempts'] += 1
@@ -598,5 +746,7 @@ if __name__ == '__main__':
     try:
         main()
     except (ReviewError, OSError, ValueError, KeyError) as exc:
-        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False), file=sys.stderr)
+        details = exc.details if isinstance(exc, ReviewError) else dict(
+            code='local_error', phase=None, status='blocked', request_id=None, next_action='inspect')
+        print(json.dumps({'ok': False, 'error': str(exc), **details}, ensure_ascii=False), file=sys.stderr)
         sys.exit(1)

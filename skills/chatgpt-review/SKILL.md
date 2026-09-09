@@ -44,12 +44,17 @@ python3 <skill>/scripts/chatgpt-review --config <private-config.json> --timeout 
 - `--config`, `--timeout`은 subcommand 앞에 둔다. `--effort`는 모델 UI 슬라이더의
   왼쪽부터 1~5 단계이며 실제 지원 범위를 벗어나면 전송하지 않는다.
 - `--file`은 반복 가능하다. UTF-8 텍스트를 JSON으로 직렬화해 줄바꿈과 특수문자를
-  보존한다. NUL·바이너리·이미지·PDF 첨부는 지원하지 않는다. 기본 합산 제한은
-  JSON 표현과 질문을 포함해 80,000자다.
+  보존한다. 파일명은 `--base-dir` 기준 상대 경로로 전송·기록한다. 기본 기준은 현재
+  디렉터리이며, 기준 밖 파일·외부로 향하는 symlink·중복 식별자는 전송 전에 거절한다.
+  NUL·바이너리·이미지·PDF 첨부는 지원하지 않는다. 기본 합산 제한은 JSON 표현과
+  질문을 포함해 80,000자다. 직렬화된 명령행 인자도 각각 120,000바이트와 OS의 전체
+  인자·환경 크기 한도를 검사하므로, 문자 수가 작아도 크기를 줄여야 할 수 있다.
 - 지정한 내용은 ChatGPT에 전송된다. 전송할 권한이 있는 파일만 선택한다.
   CLI는 별도 LLM API를 호출하지 않지만 ChatGPT 답변 사용량은 발생한다.
 - stdout은 결과 JSON이며 답변 본문은 `--out`에, 체크포인트는
   `<out>.request.json`에 저장된다. 성공 시 답변 파일을 읽어 리뷰 근거를 검토한다.
+  실패는 stderr JSON의 `code`, `phase`, `request_id`, `status`, `next_action`으로
+  확인한다. 아직 정해지지 않은 phase·request_id는 null이다.
 
 ## 중단과 회수
 
@@ -58,13 +63,19 @@ python3 <skill>/scripts/chatgpt-review --config <private-config.json> --timeout 
   자동으로 펼치지 않는다. 사용자가 내용을 확인한 뒤 직접 펼쳐야 한다. CLI lock은 사람이나 다른 도구의
   조작을 잠그지 않는다.
 - timeout 후에는 같은 설정과 `--out`으로 `collect`한다. 저장된 대화 URL로 돌아가
-  Request-ID에 대응하는 완료 답변을 회수한다. busy 상태에서는 강제 이동하지 않는다.
+  Request-ID와 요청 본문 해시가 일치하는 답변을 회수한다. busy 상태에서는 강제
+  이동하지 않는다. 해당 응답 영역의 오류 알림이 있으면 성공 처리하지 않는다.
 - `prepared` 상태는 같은 질문·파일·출력으로 `ask`를 재시도할 수 있다.
   `send_attempted`는 같은 브라우저 세션에서 클릭 receipt가 없을 때만 같은 모델·성능으로
   재시도할 수 있다. CLI가 불확실하다고 판단하면 자동 재전송하지 않는다.
 - receipt는 클릭 시도 기록이며 서버 접수 증명이 아니다. 재시도를 위해 체크포인트를
   삭제·초기화하거나 새 Request-ID/출력 경로로 우회하지 않는다.
-- 미완료 답변이 생성 중이 아닌 상태로 30초 정지하면 한 번 다시 연다.
+- URL 기록 전 중단되어 `needs_manual_recovery`가 나오면 같은 출력 경로로
+  `collect --out <private-dir>/review.txt --conversation '<확인한 대화 URL>'`을 실행한다.
+  같은 프로젝트인지, Request-ID와 요청 본문 해시가 일치하는지 검증한 뒤 연결한다.
+  확인할 URL이 없으면 사람이 대화를 찾아야 하며 `ask`로 재전송하지 않는다.
+- 답변 요소가 아직 없거나 미완료인 상태에서, 생성 표시와 본문 변화가 30초 동안
+  없으면 한 번 다시 연다. 명시적 오류 알림은 재열기로 자동 처리하지 않는다.
   `--reopen-after 0`으로 끌 수 있다. 명시적 복구는 `collect --reopen`이며 재전송하지 않는다.
 - 출력 파일을 덮어쓰지 않는다. 답변·체크포인트는 복구에 필요해 자동 삭제하지 않는다.
   작업 종료 후 사용자 보관 정책에 따라 함께 정리하고 공개물에는 포함하지 않는다.
@@ -73,10 +84,12 @@ python3 <skill>/scripts/chatgpt-review --config <private-config.json> --timeout 
 
 원문 보존과 저장 충돌은 `python3 <skill>/tests/check_file_content.py`,
 `python3 <skill>/tests/check_storage.py`, `python3 <skill>/tests/check_config_lock.py`로 확인한다.
+상태 판정·복구 거절·명령행 크기 경계는 `python3 <skill>/tests/check_collection.py`로 확인한다.
 이 테스트의 임시 파일은 종료 시 정리한다.
 
 실제 전송·중단 복구 검증이 필요하면 `tests/check_dispatch_recovery.py --help`를
 확인한다. 개인 설정·모델·성능·같은 프로젝트의 다른 대화 URL·기존 출력 디렉터리를
-명시해야 한다. 테스트 요청 1개를 실제로 전송하며 결과는 고유 하위 폴더에 보관한다.
+명시해야 한다. 테스트 요청 1개를 실제로 전송하고, 전송 클릭 후 URL 기록 전에 테스트
+CLI를 종료한 뒤 명시적 URL 연결로 회수한다. 결과는 고유 하위 폴더에 보관한다.
 DOM 원문 일치·중복 요청 차단을 확인하지만 서버의 요청 수를 측정하지는 않는다.
 테스트 대화와 결과는 자동 삭제하지 않는다.

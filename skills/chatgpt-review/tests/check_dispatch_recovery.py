@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import runpy
 import subprocess
+import sys
 import time
 import uuid
 
@@ -25,8 +26,6 @@ folder.mkdir(mode=0o700)
 (folder / 'notes.txt').write_bytes('TEST_TOKEN = "BETA-17"\r\n곱셈으로 고치세요.\r원문 escape: \\n "quote"\tend\n'.encode())
 output = folder / 'answer.txt'
 checkpoint = folder / 'answer.txt.request.json'
-recovery = folder / 'recovery.txt'
-recovery_checkpoint = folder / 'recovery.txt.request.json'
 question = '두 파일의 TEST_TOKEN 값과 올바른 return 식을 한 줄로만 답하세요.'
 request_id = 'LOCAL-REVIEW-' + uuid.uuid4().hex
 parts = [f'Request-ID: {request_id}', question]
@@ -34,7 +33,7 @@ files = []
 file_args = []
 for name in ['price.py', 'notes.txt']:
     path = folder / name
-    part, file_info = module['file_part'](path)
+    part, file_info = module['file_part'](path, folder)
     parts.append(part)
     files.append(file_info)
     file_args.extend(['--file', str(path)])
@@ -89,52 +88,65 @@ with module['page_lock'](config['page']):
         raise AssertionError('changed browser session was accepted')
 print(json.dumps({'folder': str(folder), 'guards': results, 'preclick_interruption': True}), flush=True)
 base = [str(script), '--config', str(args.config), '--timeout', '300', 'ask', '--model', args.model, '--effort', str(args.effort),
-        '--question', question, *file_args]
-process = subprocess.Popen([*base, '--out', str(output)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-captured = False
-while process.poll() is None:
-    record_bytes = checkpoint.read_bytes()
-    pending = json.loads(record_bytes)
-    if not captured and pending['status'] == 'send_attempted' and 'conversation' in pending:
-        recovery_checkpoint.write_bytes(record_bytes)
-        captured = True
-        print('전송 직후 체크포인트 보관', flush=True)
-    time.sleep(0.2)
-stdout, stderr = process.communicate()
-print(json.dumps({'ask_exit': process.returncode, 'stdout': stdout, 'stderr': stderr}, ensure_ascii=False), flush=True)
-assert captured
-assert process.returncode == 0, stderr
-pending = json.loads(recovery_checkpoint.read_text())
+        '--question', question, '--base-dir', str(folder), *file_args]
+crash_runner = """import os,runpy,sys
+script=sys.argv[1]
+sys.argv=sys.argv[1:]
+module=runpy.run_path(script,run_name='interrupted_dispatch')
+def interrupt_before_url(*args):
+    os._exit(86)
+module['Browser'].remember_conversation=interrupt_before_url
+module['main']()
+"""
+process = subprocess.run([sys.executable, '-c', crash_runner, *base, '--out', str(output)],
+                         capture_output=True, text=True, timeout=320)
+assert process.returncode == 86, process.stderr
+pending = json.loads(checkpoint.read_text())
+assert pending['status'] == 'send_attempted' and 'conversation' not in pending
+assert not output.exists()
 browser = module['Browser'](config, 180)
 with module['page_lock'](config['page']):
     assert browser.dispatch_receipt(pending)['phase'] == 'clicked'
     duplicate = browser.submit_guarded(prompt, args.model, args.effort, request_id, scope)
     assert duplicate == {'sent': False, 'reason': 'already_attempted', 'uncertain': True}
-result = subprocess.run([*base, '--out', str(recovery)], capture_output=True, text=True, timeout=45)
+    while time.monotonic() < browser.deadline:
+        state = browser.state()
+        if module['response_observation'](state, pending)['status'] == 'complete':
+            break
+        time.sleep(2)
+    else:
+        raise AssertionError('test response is still generating; conversation retained')
+    actual_url = state['url']
+    browser.validate_conversation_url(actual_url)
+result = subprocess.run([*base, '--out', str(output)], capture_output=True, text=True, timeout=45)
 assert result.returncode == 1 and 'collect' in result.stderr, result.stderr
-other_url = args.other_conversation
 with module['page_lock'](config['page']):
-    browser.open_conversation(other_url)
-    assert browser.state()['url'] == other_url and other_url != pending['conversation']
-result = subprocess.run([str(script), '--config', str(args.config), '--timeout', '150', 'collect', '--out', str(recovery)],
-                        capture_output=True, text=True, timeout=160)
+    browser.open_conversation(args.other_conversation)
+    assert browser.state()['url'] == args.other_conversation and args.other_conversation != actual_url
+collect = [str(script), '--config', str(args.config), '--timeout', '150', 'collect', '--out', str(output)]
+missing = [str(script), '--config', str(args.config), '--timeout', '4', 'collect', '--out', str(output)]
+result = subprocess.run(missing, capture_output=True, text=True, timeout=15)
+assert result.returncode == 1 and json.loads(result.stderr)['code'] == 'needs_manual_recovery', result.stderr
+assert json.loads(checkpoint.read_text())['status'] == 'needs_manual_recovery'
+result = subprocess.run([*collect, '--conversation', actual_url], capture_output=True, text=True, timeout=160)
 assert result.returncode == 0, result.stderr
-recovered = json.loads(recovery_checkpoint.read_text())
-assert recovered['conversation'] == pending['conversation']
-assert recovered['request_id'] == request_id
+recovered = json.loads(checkpoint.read_text())
+assert recovered['conversation'] == actual_url and recovered['request_id'] == request_id
 assert recovered['reopen_attempts'] == 0, recovered['reopen_attempts']
-assert 'ALPHA-93' in recovery.read_text() and 'BETA-17' in recovery.read_text()
-assert 'unit_price * qty' in recovery.read_text()
+assert 'ALPHA-93' in output.read_text() and 'BETA-17' in output.read_text()
+assert 'unit_price * qty' in output.read_text()
 with module['page_lock'](config['page']):
     state = browser.state()
     users = [message for message in state['messages']
              if message['role'] == 'user' and request_id in message['text']]
-    assert len(users) == 1
-    assert users[0]['text'].strip() == prompt.strip()
+    assert len(users) == 1 and users[0]['text'].strip() == prompt.strip()
 report = {'guards': results, 'preclick_interruption_retry': True, 'duplicate_submit': duplicate,
-          'duplicate_ask_blocked': True, 'recovered_from_other_conversation': True,
+          'process_exit_before_url_recorded': process.returncode,
+          'manual_recovery_required': True, 'duplicate_ask_blocked': True,
+          'recovered_from_other_conversation': True, 'request_hash_verified': True,
           'navigation_reopen_attempts': recovered['reopen_attempts'], 'two_files_preserved': True,
-          'matching_user_messages': len(users), 'submitted_prompt_exact_match': True, 'response_model': recovered['response_model'],
+          'matching_user_messages': len(users), 'submitted_prompt_exact_match': True,
+          'response_model': recovered['response_model'],
           'source_sha256': hashlib.sha256(script.read_bytes()).hexdigest()}
 (folder / 'results.json').write_text(json.dumps(report, ensure_ascii=False, indent=2))
 print(json.dumps(report, ensure_ascii=False), flush=True)
