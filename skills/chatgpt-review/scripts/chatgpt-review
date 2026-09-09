@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 import time
@@ -125,7 +126,7 @@ class Browser:
     def error_context(self):
         try:
             yield
-        except (ReviewError, OSError, ValueError, KeyError) as exc:
+        except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
             error = exc if isinstance(exc, ReviewError) else ReviewError(str(exc), code='local_error')
             if error.details['phase'] is None:
                 error.details['phase'] = self.phase
@@ -179,15 +180,25 @@ class Browser:
         try:
             data = json.loads(result.stdout)
         except json.JSONDecodeError as exc:
-            raise ReviewError('Orca가 JSON 응답을 반환하지 않았습니다.') from exc
-        if result.returncode or not data.get('ok'):
+            raise ReviewError('Orca가 JSON 응답을 반환하지 않았습니다.', code='invalid_orca_response', next_action=self.next_action) from exc
+        if not isinstance(data, dict) or type(data.get('ok')) is not bool:
+            raise ReviewError('Orca 응답 구조가 잘못됐습니다.', code='invalid_orca_response',
+                              next_action=self.next_action)
+        if result.returncode or not data['ok']:
             error = data.get('error', {})
             code = error.get('code', 'orca_error') if isinstance(error, dict) else 'orca_error'
-            raise ReviewError(f'Orca 오류: {code}')
+            raise ReviewError(f'Orca 오류: {code}', code='orca_error')
+        if 'result' not in data:
+            raise ReviewError('Orca 응답에 result가 없습니다.', code='invalid_orca_response',
+                              next_action=self.next_action)
         return data['result']
 
     def evaluate(self, expression):
-        return self.call('eval', '--expression', self.eval_expression(expression))['result']
+        result = self.call('eval', '--expression', self.eval_expression(expression))
+        if not isinstance(result, dict) or 'result' not in result:
+            raise ReviewError('Orca eval 응답 구조가 잘못됐습니다.', code='invalid_orca_response',
+                              next_action=self.next_action)
+        return result['result']
 
     def data(self, expression):
         return json.loads(self.evaluate(expression))
@@ -333,7 +344,7 @@ class Browser:
         return {'model': model, 'effort': effort, 'menu': label}
 
     def browser_scope(self):
-        return self.data(r"""JSON.stringify((() => {
+        scope = self.data(r"""JSON.stringify((() => {
           if (location.origin !== 'https://chatgpt.com') throw Error('wrong origin');
           const key = 'local-chat-review:scope';
           let scope = sessionStorage.getItem(key);
@@ -342,6 +353,10 @@ class Browser:
           }
           return scope;
         })())""")
+        if not isinstance(scope, str) or not scope:
+            raise ReviewError('브라우저 세션 응답이 잘못됐습니다.', code='invalid_orca_response',
+                              next_action=self.next_action)
+        return scope
 
     def dispatch_receipt(self, record):
         if 'browser_scope' not in record:
@@ -353,13 +368,21 @@ class Browser:
           const raw = sessionStorage.getItem('local-chat-review:dispatch:' + expected.id);
           return {same_session:true, receipt:raw === null ? null : JSON.parse(raw)};
         })())""")
+        if not isinstance(result, dict) or type(result.get('same_session')) is not bool:
+            raise ReviewError('클릭 기록 응답 구조가 잘못됐습니다.', code='invalid_orca_response', next_action='collect')
         if not result['same_session']:
-            raise ReviewError('브라우저 세션이 바뀌어 전송 여부를 확정할 수 없습니다. 자동 재전송하지 않습니다.')
+            raise ReviewError('브라우저 세션이 바뀌어 전송 여부를 확정할 수 없습니다. 자동 재전송하지 않습니다.', code='session_changed')
+        if 'receipt' not in result:
+            raise ReviewError('클릭 기록 필드가 없습니다.', code='invalid_orca_response', next_action='collect')
+        receipt = result['receipt']
+        if receipt is not None and (not isinstance(receipt, dict) or receipt.get('phase') not in ('attempted', 'clicked')
+                                    or receipt.get('project') != self.config['project']):
+            raise ReviewError('클릭 기록 내용이 잘못됐습니다.', code='invalid_orca_response', next_action='collect')
         return result['receipt']
 
     def stage_dispatch(self, record, record_path):
         scope = self.browser_scope()
-        if record['status'] == 'send_attempted' and record['browser_scope'] != scope:
+        if record['status'] in ('send_attempted', 'needs_manual_recovery') and record['browser_scope'] != scope:
             raise ReviewError('브라우저 세션이 바뀌어 재시도할 수 없습니다. collect를 사용하세요.')
         record['browser_scope'] = scope
         record['status'] = 'send_attempted'
@@ -459,16 +482,25 @@ class Browser:
         def locate():
             state = self.state()
             prefix = self.config['project'].removesuffix('project') + 'c/'
-            if not state['url'].startswith(prefix) or state['work']:
-                return False
-            if request_index(state, record) is None:
-                return False
-            self.validate_conversation_url(state['url'])
-            record['conversation'] = state['url']
-            if record['status'] == 'needs_manual_recovery':
-                record['status'] = 'send_attempted'
-            self.save_record(record_path, record)
-            return True
+            if state['url'].startswith(prefix) and not state['work'] and request_index(state, record) is not None:
+                self.validate_conversation_url(state['url'])
+                record['conversation'] = state['url']
+                if record['status'] == 'needs_manual_recovery':
+                    record['status'] = 'send_attempted'
+                self.save_record(record_path, record)
+                return True
+            if 'browser_scope' in record:
+                try:
+                    receipt = self.dispatch_receipt(record)
+                except ReviewError as exc:
+                    if exc.details['code'] != 'session_changed':
+                        raise
+                else:
+                    if receipt is None:
+                        raise ReviewError('같은 브라우저 세션에 클릭 기록이 없습니다. 같은 요청으로 ask를 재시도하세요.',
+                                          code='not_sent', phase='locate', status=record['status'],
+                                          request_id=record['request_id'], next_action='ask')
+            return False
         try:
             self.wait(locate, '전송된 대화 주소 저장')
         except ReviewError as exc:
@@ -612,9 +644,56 @@ def result_json(output, record_path, record):
             'model': record['model'], 'effort': record['effort'], 'conversation': record['conversation']}
 
 
-def file_part(path, base_dir):
-    base = base_dir.expanduser().resolve()
-    resolved = path.expanduser().resolve()
+def check_input_deadline(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ReviewError('파일 준비 제한 시간을 초과했습니다.', code='input_timeout', phase='prepare')
+
+
+def read_regular_file(base, relative, max_bytes, deadline):
+    check_input_deadline(deadline)
+    directory = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    source = None
+    try:
+        for component in (*base.parts[1:], *relative.parts[:-1]):
+            check_input_deadline(deadline)
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        source = os.open(relative.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        metadata = os.fstat(source)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ReviewError('일반 텍스트 파일만 읽을 수 있습니다.', code='invalid_file', phase='prepare')
+        if metadata.st_size > max_bytes:
+            raise ReviewError('파일 입력 바이트 한도를 초과했습니다.', code='request_too_large',
+                              phase='prepare', next_action='reduce_input')
+        chunks = []
+        size = 0
+        while True:
+            check_input_deadline(deadline)
+            chunk = os.read(source, min(65536, max_bytes - size + 1))
+            check_input_deadline(deadline)
+            if not chunk:
+                return b''.join(chunks)
+            size += len(chunk)
+            if size > max_bytes:
+                raise ReviewError('파일 입력 바이트 한도를 초과했습니다.', code='request_too_large',
+                                  phase='prepare', next_action='reduce_input')
+            chunks.append(chunk)
+    except OSError as exc:
+        raise ReviewError('파일 경로가 변경됐거나 안전하게 열 수 없습니다.', code='invalid_file', phase='prepare') from exc
+    finally:
+        if source is not None:
+            os.close(source)
+        os.close(directory)
+
+
+def file_part(path, base_dir, *, max_bytes=120000, deadline=None):
+    check_input_deadline(deadline)
+    try:
+        base = base_dir.expanduser().resolve()
+        resolved = path.expanduser().resolve()
+    except (OSError, RuntimeError) as exc:
+        raise ReviewError('파일 경로를 확인할 수 없습니다.', code='invalid_file', phase='prepare') from exc
     try:
         relative = resolved.relative_to(base)
     except ValueError:
@@ -622,7 +701,7 @@ def file_part(path, base_dir):
     label = relative.as_posix()
     if '\\' in label or any(ch < ' ' or ch == '\x7f' for ch in label):
         raise ReviewError('파일 이름에 제어 문자나 역슬래시가 있습니다.')
-    raw = resolved.read_bytes()
+    raw = read_regular_file(base, relative, max_bytes, deadline)
     content = raw.decode('utf-8')
     if '\x00' in content:
         raise ReviewError(f'텍스트 파일이 아닙니다: {label}')
@@ -631,12 +710,17 @@ def file_part(path, base_dir):
             {'name': label, 'sha256': hashlib.sha256(raw).hexdigest()})
 
 
-def prepare_files(paths, base_dir):
+def prepare_files(paths, base_dir, *, max_bytes=120000, deadline=None):
     parts = []
     file_infos = []
     seen = set()
+    remaining = max_bytes
     for path in paths:
-        part, info = file_part(path, base_dir)
+        part, info = file_part(path, base_dir, max_bytes=remaining, deadline=deadline)
+        remaining -= len(part.encode('utf-8'))
+        if remaining < 0:
+            raise ReviewError('파일 입력 합산 바이트 한도를 초과했습니다.', code='request_too_large',
+                              phase='prepare', next_action='reduce_input')
         if info['name'] in seen:
             raise ReviewError(f"같은 파일을 여러 번 지정했습니다: {info['name']}")
         seen.add(info['name'])
@@ -672,6 +756,50 @@ def load_config(path):
         raise ReviewError('설정한 Orca 실행 파일을 찾을 수 없거나 실행할 수 없습니다.')
     config['orca'] = executable
     return config
+
+
+def load_record(path):
+    try:
+        record = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(record, dict):
+            raise ValueError('object required')
+        for key in ('request_id', 'project', 'page', 'model', 'prompt_sha256'):
+            if not isinstance(record.get(key), str) or not record[key]:
+                raise ValueError(key)
+        if not re.fullmatch(r'[0-9a-f]{64}', record['prompt_sha256']):
+            raise ValueError('prompt_sha256')
+        if record.get('status') not in ('prepared', 'send_attempted', 'needs_manual_recovery', 'answer_ready', 'completed'):
+            raise ValueError('status')
+        if record['status'] == 'prepared' and any(key in record for key in
+                ('browser_scope', 'conversation', 'message_id', 'answer_sha256', 'response_model', 'last_rejection')):
+            raise ValueError('prepared dispatch evidence')
+        if type(record.get('effort')) is not int or not 1 <= record['effort'] <= 5:
+            raise ValueError('effort')
+        if not isinstance(record.get('files'), list):
+            raise ValueError('files')
+        for file in record['files']:
+            if not isinstance(file, dict) or not isinstance(file.get('name'), str) or not file['name']:
+                raise ValueError('file name')
+            if not isinstance(file.get('sha256'), str) or not re.fullmatch(r'[0-9a-f]{64}', file['sha256']):
+                raise ValueError('file hash')
+        if 'reopen_attempts' not in record:
+            record['reopen_attempts'] = 0
+        if type(record['reopen_attempts']) is not int or record['reopen_attempts'] < 0:
+            raise ValueError('reopen_attempts')
+        if record['status'] != 'prepared' and (not isinstance(record.get('browser_scope'), str) or not record['browser_scope']):
+            raise ValueError('browser_scope')
+        if 'conversation' in record and (not isinstance(record['conversation'], str) or not record['conversation']):
+            raise ValueError('conversation')
+        if record['status'] in ('answer_ready', 'completed'):
+            for key in ('conversation', 'message_id', 'answer_sha256'):
+                if not isinstance(record.get(key), str) or not record[key]:
+                    raise ValueError(key)
+            if not re.fullmatch(r'[0-9a-f]{64}', record['answer_sha256']):
+                raise ValueError('answer_sha256')
+    except (ValueError, TypeError) as exc:
+        raise ReviewError('체크포인트 형식이 잘못됐습니다. 파일을 보존하고 내용을 확인하세요.',
+                          code='invalid_checkpoint', phase='load', next_action='inspect') from exc
+    return record
 
 
 def main():
@@ -714,7 +842,7 @@ def main():
             raise ReviewError('--reopen-after는 0 이상이어야 합니다.')
         if output.exists():
             if args.command == 'collect' and record_path.is_file():
-                record = json.loads(record_path.read_text())
+                record = load_record(record_path)
                 browser.record = dict(record)
                 browser.phase = 'recover'
                 if record['project'] != config['project'] or record['page'] != config['page']:
@@ -735,11 +863,11 @@ def main():
         if args.command == 'ask':
             previous_record = None
             if record_path.exists():
-                previous_record = json.loads(record_path.read_text())
+                previous_record = load_record(record_path)
                 browser.record = dict(previous_record)
                 if previous_record['status'] != 'prepared':
                     browser.next_action = 'collect'
-                if previous_record['status'] == 'send_attempted':
+                if previous_record['status'] in ('send_attempted', 'needs_manual_recovery'):
                     receipt = browser.dispatch_receipt(previous_record)
                     if receipt is not None:
                         raise ReviewError('이미 전송을 시도한 요청입니다. collect를 사용하세요.')
@@ -752,7 +880,7 @@ def main():
                     raise ReviewError('기존 요청의 프로젝트/탭이 현재 설정과 다릅니다.')
             request_id = previous_record['request_id'] if previous_record is not None else 'LOCAL-REVIEW-' + uuid.uuid4().hex
             parts = [f'Request-ID: {request_id}', args.question]
-            file_parts, files = prepare_files(args.file, args.base_dir)
+            file_parts, files = prepare_files(args.file, args.base_dir, deadline=browser.deadline)
             parts.extend(file_parts)
             prompt = '\n\n'.join(parts)
             if not args.question.strip() or len(prompt) > args.max_chars:
@@ -764,19 +892,19 @@ def main():
                       'status': 'prepared', 'model': args.model, 'effort': args.effort,
                       'files': files, 'prompt_sha256': digest,
                       'reopen_attempts': 0}
-            if previous_record is not None and previous_record['status'] == 'send_attempted':
+            if previous_record is not None and previous_record['status'] in ('send_attempted', 'needs_manual_recovery'):
                 record = previous_record
             if previous_record is None:
                 browser.record = {'request_id': request_id}
             browser.phase = 'prepare'
-            scope = record['browser_scope'] if record['status'] == 'send_attempted' else '0' * 36
+            scope = record['browser_scope'] if record['status'] in ('send_attempted', 'needs_manual_recovery') else '0' * 36
             browser.validate_request_size(prompt, args.model, args.effort, request_id, scope)
             browser.save_record(record_path, record, create=previous_record is None)
             browser.project(prompt)
             record['selection'] = browser.select_model(args.model, args.effort)
             browser.send(prompt, record, record_path)
         else:
-            record = json.loads(record_path.read_text())
+            record = load_record(record_path)
             browser.record = dict(record)
             browser.phase = 'recover'
             if record['status'] in ('send_attempted', 'answer_ready', 'needs_manual_recovery'):
@@ -785,8 +913,6 @@ def main():
                 raise ReviewError('요청 기록과 현재 설정의 프로젝트/탭이 다릅니다.')
             if record['status'] not in ('send_attempted', 'answer_ready', 'needs_manual_recovery'):
                 raise ReviewError('전송 시도 기록이 없습니다.')
-            if 'reopen_attempts' not in record:
-                record['reopen_attempts'] = 0
             if args.conversation:
                 browser.bind_conversation(record, record_path, args.conversation)
             elif 'conversation' not in record:
@@ -812,7 +938,7 @@ def main():
 if __name__ == '__main__':
     try:
         main()
-    except (ReviewError, OSError, ValueError, KeyError) as exc:
+    except (ReviewError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         details = exc.details if isinstance(exc, ReviewError) else dict(
             code='local_error', phase=None, status='blocked', request_id=None, next_action='inspect')
         print(json.dumps({'ok': False, 'error': str(exc), **details}, ensure_ascii=False), file=sys.stderr)

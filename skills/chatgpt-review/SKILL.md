@@ -46,6 +46,8 @@ python3 <skill>/scripts/chatgpt-review --config <private-config.json> --timeout 
 - `--file`은 반복 가능하다. UTF-8 텍스트를 JSON으로 직렬화해 줄바꿈과 특수문자를
   보존한다. 파일명은 `--base-dir` 기준 상대 경로로 전송·기록한다. 기본 기준은 현재
   디렉터리이며, 기준 밖 파일·외부로 향하는 symlink·중복 식별자는 전송 전에 거절한다.
+  일반 파일만 읽으며 FIFO·장치·디렉터리는 거절한다. 파일을 여는 동안의 symlink 교체도
+  차단하고, 파일 입력은 합산 120,000바이트 예산 안에서 읽는다.
   NUL·바이너리·이미지·PDF 첨부는 지원하지 않는다. 기본 합산 제한은 JSON 표현과
   질문을 포함해 80,000자다. 직렬화된 명령행 인자도 각각 120,000바이트와 OS의 전체
   인자·환경 크기 한도를 검사하므로, 문자 수가 작아도 크기를 줄여야 할 수 있다.
@@ -66,14 +68,16 @@ python3 <skill>/scripts/chatgpt-review --config <private-config.json> --timeout 
   Request-ID와 요청 본문 해시가 일치하는 답변을 회수한다. busy 상태에서는 강제
   이동하지 않는다. 해당 응답 영역의 오류 알림이 있으면 성공 처리하지 않는다.
 - `prepared` 상태는 같은 질문·파일·출력으로 `ask`를 재시도할 수 있다.
-  `send_attempted`는 같은 브라우저 세션에서 클릭 receipt가 없을 때만 같은 모델·성능으로
-  재시도할 수 있다. CLI가 불확실하다고 판단하면 자동 재전송하지 않는다.
+  `send_attempted`와 `needs_manual_recovery`는 같은 브라우저 세션에서 클릭 receipt가
+  없음을 확인했을 때만 같은 질문·파일·모델·성능으로 재시도할 수 있다.
+  `collect`가 `code: not_sent`, `next_action: ask`를 반환하면 같은 요청으로 `ask`한다. CLI가 불확실하다고 판단하면 자동 재전송하지 않는다.
 - receipt는 클릭 시도 기록이며 서버 접수 증명이 아니다. 재시도를 위해 체크포인트를
   삭제·초기화하거나 새 Request-ID/출력 경로로 우회하지 않는다.
 - URL 기록 전 중단되어 `needs_manual_recovery`가 나오면 같은 출력 경로로
   `collect --out <private-dir>/review.txt --conversation '<확인한 대화 URL>'`을 실행한다.
   같은 프로젝트인지, Request-ID와 요청 본문 해시가 일치하는지 검증한 뒤 연결한다.
-  확인할 URL이 없으면 사람이 대화를 찾아야 하며 `ask`로 재전송하지 않는다.
+  클릭 기록이 있거나 브라우저 세션이 바뀌었는데 확인할 URL이 없으면 사람이 대화를
+  찾아야 하며 `ask`로 재전송하지 않는다.
 - 답변 요소가 아직 없거나 미완료인 상태에서, 생성 표시와 본문 변화가 30초 동안
   없으면 한 번 다시 연다. 명시적 오류 알림은 재열기로 자동 처리하지 않는다.
   `--reopen-after 0`으로 끌 수 있다. 명시적 복구는 `collect --reopen`이며 재전송하지 않는다.
@@ -85,6 +89,8 @@ python3 <skill>/scripts/chatgpt-review --config <private-config.json> --timeout 
 원문 보존과 저장 충돌은 `python3 <skill>/tests/check_file_content.py`,
 `python3 <skill>/tests/check_storage.py`, `python3 <skill>/tests/check_config_lock.py`로 확인한다.
 상태 판정·복구 거절·명령행 크기 경계는 `python3 <skill>/tests/check_collection.py`로 확인한다.
+파일 경합·특수 파일·읽기 제한은 `python3 <skill>/tests/check_file_safety.py`,
+오류 응답·체크포인트 형식·미클릭 복구는 `python3 <skill>/tests/check_error_recovery.py`로 확인한다.
 이 테스트의 임시 파일은 종료 시 정리한다.
 
 실제 전송·중단 복구 검증이 필요하면 `tests/check_dispatch_recovery.py --help`를

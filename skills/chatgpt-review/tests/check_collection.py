@@ -246,7 +246,9 @@ with tempfile.TemporaryDirectory() as folder:
                 raise AssertionError('save failure accepted')
     output = Path(folder) / 'answer.txt'
     checkpoint = output.with_name(output.name + '.request.json')
-    pending = dict(record, status='prepared', project=config['project'], page=config['page'])
+    pending = dict(record, status='prepared', project=config['project'], page=config['page'],
+                   model='Model', effort=1, files=[])
+    del pending['conversation']
     module['save_json'](checkpoint, pending)
     argv = ['chatgpt-review', '--config', 'fixture.json', 'collect', '--out', str(output)]
     with patch.object(sys, 'argv', argv), patch.dict(module['main'].__globals__, {'load_config': lambda p: config}):
@@ -263,6 +265,7 @@ with tempfile.TemporaryDirectory() as folder:
     output.write_text('answer\n')
     checkpoint = output.with_name(output.name + '.request.json')
     pending = dict(record, status='answer_ready', project=config['project'], page=config['page'],
+                   model='Model', effort=1, files=[], browser_scope='fixture-scope', message_id='answer-id',
                    answer_sha256=module['hashlib'].sha256(output.read_bytes()).hexdigest())
     module['save_json'](checkpoint, pending)
     before = checkpoint.read_bytes()
@@ -334,7 +337,7 @@ with tempfile.TemporaryDirectory() as folder:
                 try:
                     browser.bind_conversation(pending, checkpoint, url)
                 except ReviewError as exc:
-                    assert exc.details['code'] == 'review_error'
+                    assert exc.details['code'] == ('invalid_orca_response' if stdout == 'not JSON' else 'orca_error')
                     assert 'Orca' in str(exc) and '제한 시간' not in str(exc)
                     assert clock.now == 0.5 and checkpoint.read_bytes() == before
                 else:
