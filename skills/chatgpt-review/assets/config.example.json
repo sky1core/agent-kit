@@ -1,0 +1,6 @@
+{
+  "orca": "orca",
+  "page": "<browserPageId>",
+  "project": "https://chatgpt.com/g/g-p-<project-id>/project",
+  "project_name": "<프로젝트 표시 이름>"
+}

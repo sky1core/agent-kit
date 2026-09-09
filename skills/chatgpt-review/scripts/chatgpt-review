@@ -1,0 +1,602 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+class ReviewError(Exception):
+    pass
+
+
+STATE_JS = r"""JSON.stringify((() => {
+  const main = document.querySelector('main');
+  const editor = document.querySelector('#prompt-textarea');
+  const plain = n => n.nodeType === Node.TEXT_NODE ? n.nodeValue
+    : n.nodeName === 'BR' ? (n.classList.contains('ProseMirror-trailingBreak') ? '' : '\n')
+    : [...n.childNodes].map(plain).join('');
+  return {
+    url: location.origin + location.pathname,
+    ready: document.readyState,
+    editor: editor ? editor.innerText : null,
+    editor_plain: editor && [...editor.children].every(e => e.tagName === 'P')
+      ? [...editor.children].map(plain).join('\n') : null,
+    work: document.querySelector('[data-tpp-toggle-value="work"]')?.getAttribute('aria-checked') === 'true',
+    busy: !!document.querySelector('[data-testid="stop-button"]'),
+    pending_tiles: document.querySelectorAll('[data-composer-body] [class~="group/file-tile"]').length,
+    messages: [...(main?.querySelectorAll('[data-message-author-role]') || [])].map(e => ({
+      role: e.getAttribute('data-message-author-role'),
+      model: e.getAttribute('data-message-model-slug'),
+      id: e.getAttribute('data-message-id'),
+      text: e.innerText,
+      answer: [...e.querySelectorAll('.markdown')].map(n => n.innerText).join('\n\n'),
+      complete: !!e.closest('[data-turn="assistant"]')?.querySelector('[data-testid="copy-turn-action-button"]')
+    })),
+    alerts: [...document.querySelectorAll('[role="alert"]')].map(e => e.innerText).filter(Boolean)
+  };
+})())"""
+
+
+class Browser:
+    def __init__(self, config, timeout):
+        self.config = config
+        self.deadline = time.monotonic() + timeout
+        self.phase = '시작'
+
+    def call(self, *args):
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise ReviewError('시간 초과. 자동으로 재전송하지 않습니다.')
+        try:
+            result = subprocess.run(
+                [self.config['orca'], *args, '--page', self.config['page'], '--json'],
+                capture_output=True, text=True, timeout=min(30, remaining),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise ReviewError('Orca 응답 시간 초과. 전송 결과가 불확실하면 collect를 사용하세요.') from exc
+        try:
+            data = json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise ReviewError('Orca가 JSON 응답을 반환하지 않았습니다.') from exc
+        if result.returncode or not data.get('ok'):
+            error = data.get('error', {})
+            code = error.get('code', 'orca_error') if isinstance(error, dict) else 'orca_error'
+            raise ReviewError(f'Orca 오류: {code}')
+        return data['result']
+
+    def evaluate(self, expression):
+        return self.call('eval', '--expression', expression)['result']
+
+    def data(self, expression):
+        return json.loads(self.evaluate(expression))
+
+    def state(self):
+        return self.data(STATE_JS)
+
+    def wait(self, check, description):
+        self.phase = description
+        deadline = min(self.deadline, time.monotonic() + 25)
+        while time.monotonic() < deadline:
+            value = check()
+            if value:
+                return value
+            time.sleep(0.5)
+        raise ReviewError(f'시간 초과: {description}. 자동 재전송하지 않습니다.')
+
+    def click(self, role, name):
+        selector = 'button' if role == 'button' else f'[role="{role}"]'
+        self.evaluate(r"""(() => {
+          const nodes = [...document.querySelectorAll(""" + json.dumps(selector) + r""")]
+            .filter(e => e.getClientRects().length && !e.closest('[role="menu"][data-state="closed"]') &&
+              (e.getAttribute('aria-label') || e.innerText).replace(/\s+/g, ' ').trim() === """ + json.dumps(name) + r""");
+          if (nodes.length !== 1) throw Error('UI target not unique');
+          const e = nodes[0];
+          e.dispatchEvent(new PointerEvent('pointerdown', {bubbles:true,cancelable:true,button:0,pointerType:'mouse',isPrimary:true}));
+          e.dispatchEvent(new PointerEvent('pointerup', {bubbles:true,cancelable:true,button:0,pointerType:'mouse',isPrimary:true}));
+          e.click(); return true;
+        })()""")
+
+    def key(self, selector, key):
+        self.evaluate(r"""(() => {
+          const nodes = document.querySelectorAll(""" + json.dumps(selector) + r""");
+          if (nodes.length !== 1) throw Error('keyboard target not unique');
+          nodes[0].focus();
+          for (const type of ['keydown', 'keyup'])
+            nodes[0].dispatchEvent(new KeyboardEvent(type, {key:""" + json.dumps(key) + r""",bubbles:true,cancelable:true}));
+          return true;
+        })()""")
+
+    def project(self, expected_draft=None):
+        state = self.state()
+        if not state['url'].startswith('https://chatgpt.com/'):
+            raise ReviewError('ChatGPT 로그인 화면 또는 다른 사이트입니다. Orca에서 로그인하세요.')
+        draft = (state['editor_plain'] or '').strip()
+        owned_draft = expected_draft is not None and draft == expected_draft.strip() and state['url'] == self.config['project'] and not state['messages']
+        if state['busy'] or state['pending_tiles'] or ((state['editor'] or '').strip() and not owned_draft):
+            raise ReviewError('현재 탭에 작성 중인 입력 또는 생성 중인 답변이 있습니다.')
+        if state['work']:
+            raise ReviewError('Work 모드에서는 실행하지 않습니다.')
+        self.phase = '프로젝트 이동'
+        if state['url'] == self.config['project'] and state['editor'] is not None and not state['messages']:
+            return
+        if state['editor'] is None:
+            self.call('goto', '--url', 'https://chatgpt.com/')
+
+            def home_ready():
+                state = self.state()
+                if '/auth/' in state['url']:
+                    raise ReviewError('로그인이 만료됐습니다. Orca에서 직접 로그인하세요.')
+                return state['url'] == 'https://chatgpt.com/' and state['editor'] is not None
+
+            self.wait(home_ready, 'ChatGPT 홈')
+        name = json.dumps(self.config['project_name'])
+        self.evaluate(r"""(() => {
+          const rows = [...document.querySelectorAll('[data-sidebar-item][role="button"]')]
+            .filter(e => e.innerText.trim() === """ + name + r""");
+          if (rows.length !== 1) throw Error('project not unique or not visible in sidebar');
+          const button = rows[0].parentElement.querySelector('button[aria-label="프로젝트 홈 열기"]');
+          if (!button) throw Error('project home button missing');
+          button.click(); return true;
+        })()""")
+
+        def ready():
+            state = self.state()
+            if '/auth/' in state['url']:
+                raise ReviewError('로그인이 만료됐습니다. Orca에서 직접 로그인하세요.')
+            if state['work']:
+                raise ReviewError('Work 모드에서는 실행하지 않습니다.')
+            return state['url'] == self.config['project'] and state['editor'] is not None
+
+        self.wait(ready, '프로젝트 입력창')
+
+    def close_menu(self):
+        if self.data('JSON.stringify(!!document.querySelector(\'[role="menu"][data-state="open"]\'))'):
+            self.toggle_model_menu()
+            self.wait(lambda: not self.data('JSON.stringify(!!document.querySelector(\'[role="menu"][data-state="open"]\'))'), '메뉴 닫기')
+
+    def toggle_model_menu(self):
+        name = self.data(r"""JSON.stringify((() => {
+          const buttons = [...document.querySelectorAll('main form button[aria-haspopup="menu"]')]
+            .filter(e => !e.getAttribute('data-testid'));
+          return buttons.length === 1 ? buttons[0].innerText.replace(/\s+/g, ' ').trim() : null;
+        })())""")
+        if not name:
+            raise ReviewError('모델 메뉴 버튼을 식별하지 못했습니다.')
+        self.click('button', name)
+
+    def open_model_menu(self):
+        self.close_menu()
+        self.toggle_model_menu()
+        self.wait(lambda: self.data('JSON.stringify(!!document.querySelector(\'[role="menu"][data-state="open"]\'))'), '모델 메뉴')
+
+    def model_options(self):
+        def options():
+            return self.data("JSON.stringify([...document.querySelectorAll('[role=menu][data-state=open] [role=menuitemradio]')].map(e => ({name:e.innerText.trim(),selected:e.getAttribute('aria-checked')==='true'})))")
+
+        items = options()
+        if not items:
+            self.click('menuitem', '모델 선택')
+            items = self.wait(options, '모델 목록')
+        return items
+
+    def select_model(self, model, effort):
+        self.open_model_menu()
+        items = self.model_options()
+        if model not in [item['name'] for item in items]:
+            raise ReviewError('요청한 모델이 없습니다. models 명령으로 현재 목록을 확인하세요.')
+        self.click('menuitemradio', model)
+        self.close_menu()
+        self.open_model_menu()
+        items = self.model_options()
+        if not any(item['name'] == model and item['selected'] for item in items):
+            raise ReviewError('모델 선택 검증 실패. 전송하지 않았습니다.')
+        self.close_menu()
+        self.open_model_menu()
+
+        def slider():
+            return self.data("JSON.stringify((()=>{const e=document.querySelector('[role=menu][data-state=open] [role=slider]');return e?{min:Number(e.getAttribute('aria-valuemin')),max:Number(e.getAttribute('aria-valuemax')),value:Number(e.getAttribute('aria-valuenow'))}:null})())")
+
+        current = self.wait(slider, '성능 선택 슬라이더')
+        target = current['min'] + effort - 1
+        if target > current['max']:
+            raise ReviewError('선택한 모델에서 지원하지 않는 성능 단계입니다.')
+        for _ in range(abs(target - current['value'])):
+            self.key('[role="menu"][data-state="open"] [role="menuitem"][aria-label="성능"]', 'ArrowRight' if target > current['value'] else 'ArrowLeft')
+        self.wait(lambda: slider()['value'] == target, '성능 선택 적용')
+        label = self.data("JSON.stringify(document.querySelector('[role=menu][data-state=open]')?.innerText)")
+        self.close_menu()
+        return {'model': model, 'effort': effort, 'menu': label}
+
+    def browser_scope(self):
+        return self.data(r"""JSON.stringify((() => {
+          if (location.origin !== 'https://chatgpt.com') throw Error('wrong origin');
+          const key = 'local-chat-review:scope';
+          let scope = sessionStorage.getItem(key);
+          if (scope === null) {
+            scope = crypto.randomUUID(); sessionStorage.setItem(key, scope);
+          }
+          return scope;
+        })())""")
+
+    def dispatch_receipt(self, record):
+        if 'browser_scope' not in record:
+            raise ReviewError('전송 확인용 브라우저 세션 기록이 없습니다. collect를 사용하세요.')
+        expected = json.dumps({'scope': record['browser_scope'], 'id': record['request_id']})
+        result = self.data("JSON.stringify((() => {const expected=" + expected + r""";
+          if (location.origin !== 'https://chatgpt.com' || sessionStorage.getItem('local-chat-review:scope') !== expected.scope)
+            return {same_session:false};
+          const raw = sessionStorage.getItem('local-chat-review:dispatch:' + expected.id);
+          return {same_session:true, receipt:raw === null ? null : JSON.parse(raw)};
+        })())""")
+        if not result['same_session']:
+            raise ReviewError('브라우저 세션이 바뀌어 전송 여부를 확정할 수 없습니다. 자동 재전송하지 않습니다.')
+        return result['receipt']
+
+    def stage_dispatch(self, record, record_path):
+        scope = self.browser_scope()
+        if record['status'] == 'send_attempted' and record['browser_scope'] != scope:
+            raise ReviewError('브라우저 세션이 바뀌어 재시도할 수 없습니다. collect를 사용하세요.')
+        record['browser_scope'] = scope
+        record['status'] = 'send_attempted'
+        save_json(record_path, record)
+
+    def paste_guarded(self, prompt):
+        expected = json.dumps({'project': self.config['project'], 'prompt': prompt})
+        return self.data("JSON.stringify((() => {const expected=" + expected + ";const state=JSON.parse(" + STATE_JS + r""");
+          if (state.url !== expected.project || state.work || state.busy || state.messages.length || state.pending_tiles)
+            return {pasted:false, reason:'project_or_chat_changed'};
+          const editor = document.querySelector('#prompt-textarea[contenteditable="true"]');
+          if (!editor || editor.innerText.trim()) return {pasted:false, reason:'input_changed'};
+          editor.focus();
+          const data = new DataTransfer(); data.setData('text/plain', expected.prompt);
+          editor.dispatchEvent(new ClipboardEvent('paste', {bubbles:true,cancelable:true,clipboardData:data}));
+          return {pasted:true};
+        })())""")
+
+    def submit_guarded(self, prompt, model, effort, request_id, browser_scope):
+        expected = json.dumps({'project': self.config['project'], 'prompt': prompt.strip(),
+                               'model': model, 'effort': effort, 'id': request_id, 'scope': browser_scope})
+        return self.data("JSON.stringify((() => {const expected = " + expected + ";const state = JSON.parse(" + STATE_JS + r""");
+          const reject = reason => ({sent:false, reason});
+          if (location.origin !== 'https://chatgpt.com' || sessionStorage.getItem('local-chat-review:scope') !== expected.scope)
+            return {sent:false, reason:'session_changed', uncertain:true};
+          const receiptKey = 'local-chat-review:dispatch:' + expected.id;
+          if (sessionStorage.getItem(receiptKey) !== null)
+            return {sent:false, reason:'already_attempted', uncertain:true};
+          if (state.url !== expected.project || state.work || state.busy || state.messages.length)
+            return reject('project_or_chat_changed');
+          if (state.pending_tiles) return reject('unexpected_attachment');
+          if (state.editor_plain?.trim() !== expected.prompt) return reject('input_changed');
+          const menus = document.querySelectorAll('[role="menu"][data-state="open"]');
+          if (menus.length !== 1) return reject('model_menu_missing');
+          const selected = [...menus[0].querySelectorAll('[role="menuitemradio"][aria-checked="true"]')];
+          if (selected.length !== 1 || selected[0].innerText.trim() !== expected.model)
+            return reject('model_changed');
+          const slider = menus[0].querySelector('[role="slider"]');
+          if (!slider || Number(slider.getAttribute('aria-valuenow')) !== Number(slider.getAttribute('aria-valuemin')) + expected.effort - 1)
+            return reject('effort_changed');
+          const editor = document.querySelector('#prompt-textarea');
+          const buttons = editor?.closest('form')?.querySelectorAll('[data-testid="send-button"]:not(:disabled)');
+          if (!buttons || buttons.length !== 1) return reject('send_button_missing');
+          sessionStorage.setItem(receiptKey, JSON.stringify({phase:'attempted', project:expected.project}));
+          buttons[0].click();
+          sessionStorage.setItem(receiptKey, JSON.stringify({phase:'clicked', project:expected.project}));
+          return {sent:true};
+        })())""")
+
+    def expand_paste(self):
+        self.evaluate(r"""(() => {
+          const tiles = document.querySelectorAll('[data-composer-body] [class~="group/file-tile"]');
+          if (!tiles.length) return true;
+          const buttons = document.querySelectorAll('[data-composer-body] button[name="expand-file-tile"]');
+          if (tiles.length !== 1 || buttons.length !== 1) throw Error('unexpected attachment');
+          buttons[0].click(); return true;
+        })()""")
+        self.wait(lambda: not self.state()['pending_tiles'], '긴 붙여넣기 텍스트 펼치기')
+
+    def send(self, prompt, record, record_path):
+        state = self.state()
+        if state['url'] != self.config['project'] or state['work'] or state['busy'] or state['messages'] or state['pending_tiles']:
+            raise ReviewError('전송 직전 프로젝트 또는 Chat 상태 검증 실패.')
+        if (state['editor'] or '').strip():
+            if (state['editor_plain'] or '').strip() != prompt.strip():
+                raise ReviewError('다른 입력이 있습니다. 덮어쓰지 않습니다.')
+        else:
+            result = self.paste_guarded(prompt)
+            if not result['pasted']:
+                raise ReviewError('입력 차단: ' + result['reason'])
+            self.expand_paste()
+        if (self.state()['editor_plain'] or '').strip() != prompt.strip():
+            raise ReviewError('파일 내용 입력 검증 실패. 전송하지 않았습니다.')
+        self.wait(lambda: self.data("JSON.stringify(!!document.querySelector('[data-testid=send-button]:not(:disabled)'))"), '전송 버튼')
+        self.open_model_menu()
+        self.model_options()
+        self.stage_dispatch(record, record_path)
+        result = self.submit_guarded(prompt, record['model'], record['effort'], record['request_id'], record['browser_scope'])
+        if not result['sent']:
+            if result.get('uncertain', False):
+                raise ReviewError('전송 여부 확인 필요: ' + result['reason'] + '. collect를 사용하세요.')
+            record['last_rejection'] = result['reason']
+            save_json(record_path, record)
+            raise ReviewError('전송 차단: ' + result['reason'])
+        self.remember_conversation(record, record_path)
+
+    def remember_conversation(self, record, record_path):
+        def locate():
+            state = self.state()
+            matches = [m for m in state['messages'] if m['role'] == 'user' and record['request_id'] in m['text']]
+            if len(matches) == 1 and state['url'].startswith(self.config['project'].removesuffix('project') + 'c/'):
+                record['conversation'] = state['url']
+                save_json(record_path, record)
+                return True
+            return False
+        self.wait(locate, '전송된 대화 주소 저장')
+
+    def collect(self, record, record_path, reopen_after):
+        previous = None
+        stable = 0
+        partial = None
+        partial_since = time.monotonic()
+        prefix = self.config['project'].removesuffix('project')
+        while time.monotonic() < self.deadline:
+            state = self.state()
+            if not state['url'].startswith(prefix) or state['work']:
+                raise ReviewError('대상 프로젝트에서 벗어났습니다. 자동 재전송하지 않습니다.')
+            users = [i for i, item in enumerate(state['messages'])
+                     if item['role'] == 'user' and record['request_id'] in item['text']]
+            if len(users) > 1:
+                raise ReviewError('동일 요청이 여러 번 발견됐습니다.')
+            if users:
+                if '/c/' in state['url'] and record.get('conversation') != state['url']:
+                    record['conversation'] = state['url']
+                    save_json(record_path, record)
+                following = state['messages'][users[0] + 1:]
+                if any(item['role'] == 'user' for item in following):
+                    raise ReviewError('다른 질문이 추가됐습니다. 답변을 혼동하지 않도록 중단합니다.')
+                answers = [item for item in following if item['role'] == 'assistant']
+                if len(answers) == 1:
+                    answer = answers[0]
+                    text = answer['answer']
+                    if text != partial or state['busy']:
+                        partial = text
+                        partial_since = time.monotonic()
+                    if text and answer['complete'] and not state['busy']:
+                        stable = stable + 1 if text == previous else 1
+                        previous = text
+                        if stable >= 2:
+                            return text, state['url'], answer['model'], answer['id']
+                    elif not state['busy'] and reopen_after > 0 and record['reopen_attempts'] == 0 and time.monotonic() - partial_since >= reopen_after:
+                        record['reopen_attempts'] = 1
+                        save_json(record_path, record)
+                        self.reopen(record)
+                        previous = None
+                        stable = 0
+                        continue
+            time.sleep(2)
+        raise ReviewError('답변 대기 시간 초과. 같은 --out으로 collect를 실행하면 재전송 없이 회수합니다.')
+
+    def open_conversation(self, url):
+        prefix = self.config['project'].removesuffix('project') + 'c/'
+        if not url.startswith(prefix) or not re.fullmatch(r'[a-zA-Z0-9-]+', url[len(prefix):]):
+            raise ReviewError('기록된 대화 주소가 대상 프로젝트에 속하지 않습니다.')
+        self.project()
+        self.call('goto', '--url', url)
+
+        def ready():
+            state = self.state()
+            return state['url'] == url and state['editor'] is not None and state['messages']
+
+        self.wait(ready, '기존 대화 다시 열기')
+
+    def reopen(self, record):
+        if 'conversation' not in record:
+            raise ReviewError('대화 주소가 아직 기록되지 않았습니다. 전송 여부 확인이 필요합니다.')
+        self.open_conversation(record['conversation'])
+
+
+def save_json(path, value, create=False):
+    fd, staging_name = tempfile.mkstemp(prefix=path.name + '.', suffix='.pending', dir=path.parent)
+    staging = Path(staging_name)
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        json.dump(value, stream, ensure_ascii=False, indent=2)
+        stream.write('\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    if create:
+        try:
+            os.link(staging, path)
+        finally:
+            staging.unlink()
+    else:
+        os.replace(staging, path)
+
+
+def save_answer(path, answer):
+    fd, staging_name = tempfile.mkstemp(prefix=path.name + '.', suffix='.pending', dir=path.parent)
+    staging = Path(staging_name)
+    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+        stream.write(answer)
+        stream.flush()
+        os.fsync(stream.fileno())
+    try:
+        os.link(staging, path)
+    finally:
+        staging.unlink()
+
+
+def result_json(output, record_path, record):
+    return {'ok': True, 'out': str(output), 'request': str(record_path),
+            'model': record['model'], 'effort': record['effort'], 'conversation': record['conversation']}
+
+
+def file_part(path):
+    raw = path.read_bytes()
+    content = raw.decode('utf-8')
+    if '\x00' in content:
+        raise ReviewError(f'텍스트 파일이 아닙니다: {path.name}')
+    payload = json.dumps({'file': path.name, 'content': content}, ensure_ascii=False)
+    return ('파일 JSON (content의 JSON escape를 복원해 원문으로 읽으세요):\n' + payload,
+            {'name': path.name, 'sha256': hashlib.sha256(raw).hexdigest()})
+
+
+@contextlib.contextmanager
+def page_lock(page):
+    digest = hashlib.sha256(page.encode()).hexdigest()[:24]
+    path = Path('/tmp') / f'chatgpt-review-{os.getuid()}-{digest}.lock'
+    with path.open('a') as stream:
+        try:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ReviewError('같은 브라우저 탭에서 다른 리뷰가 실행 중입니다.') from exc
+        yield
+
+
+def load_config(path):
+    config = json.loads(path.read_text(encoding='utf-8'))
+    keys = {'orca', 'page', 'project', 'project_name'}
+    if not isinstance(config, dict) or set(config) != keys:
+        raise ReviewError('설정에는 orca, page, project, project_name을 명시해야 합니다.')
+    if any(not isinstance(value, str) or not value.strip() or value != value.strip()
+           for value in config.values()):
+        raise ReviewError('설정 값은 앞뒤 공백 없는 비어 있지 않은 문자열이어야 합니다.')
+    if not re.fullmatch(r'https://chatgpt\.com/g/g-p-[a-zA-Z0-9-]+/project', config['project']):
+        raise ReviewError('ChatGPT 프로젝트 URL이 아닙니다.')
+    executable = shutil.which(config['orca'])
+    if executable is None:
+        raise ReviewError('설정한 Orca 실행 파일을 찾을 수 없거나 실행할 수 없습니다.')
+    config['orca'] = executable
+    return config
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Orca의 일반 ChatGPT Chat을 제어합니다. LLM/API 호출 없이 파일 준비·모델 선택·전송·답변 저장을 수행합니다.')
+    parser.add_argument('--config', type=Path, required=True, help='개인 Orca 탭·프로젝트 설정 JSON 경로')
+    parser.add_argument('--timeout', type=int, default=600, help='전체 실행 제한(초), 기본 600')
+    subs = parser.add_subparsers(dest='command', required=True)
+    subs.add_parser('models', help='현재 프로젝트의 선택 가능한 모델 조회')
+    ask = subs.add_parser('ask', help='새 채팅으로 질문하고 답변을 파일에 저장')
+    ask.add_argument('--model', required=True, help='models 출력의 정확한 이름')
+    ask.add_argument('--effort', type=int, choices=range(1, 6), required=True, help='화면 왼쪽부터 성능 단계 1~5')
+    ask.add_argument('--question', required=True)
+    ask.add_argument('--file', action='append', type=Path, default=[], help='UTF-8 텍스트 파일. 여러 번 지정 가능. JSON 문자열로 원문과 줄바꿈을 보존')
+    ask.add_argument('--max-chars', type=int, default=80000, help='합친 질문의 최대 문자 수(초과하면 전송 안 함)')
+    ask.add_argument('--out', type=Path, required=True)
+    ask.add_argument('--reopen-after', type=int, default=30, help='답변이 미완료 상태로 정지하면 지정 초 후 대화를 한 번 다시 열기. 기본 30, 0이면 사용 안 함. 재전송 없음')
+    collect = subs.add_parser('collect', help='전송된 요청의 답변만 회수(재전송 없음)')
+    collect.add_argument('--out', type=Path, required=True)
+    collect.add_argument('--reopen', action='store_true', help='현재 요청의 저장된 대화 URL을 다시 열어 회수(재전송 없음)')
+    collect.add_argument('--reopen-after', type=int, default=30, help='미완료 답변 정지 시 자동으로 한 번 다시 열기까지 초. 기본 30, 0이면 사용 안 함')
+    args = parser.parse_args()
+    os.umask(0o077)
+    config = load_config(args.config)
+    if args.timeout <= 0:
+        raise ReviewError('--timeout은 양수여야 합니다.')
+    browser = Browser(config, args.timeout)
+    with page_lock(config['page']):
+        if args.command == 'models':
+            browser.project()
+            browser.open_model_menu()
+            items = browser.model_options()
+            browser.close_menu()
+            print(json.dumps({'models': items}, ensure_ascii=False))
+            return
+        output = args.out.expanduser().resolve()
+        record_path = output.with_name(output.name + '.request.json')
+        if args.reopen_after < 0:
+            raise ReviewError('--reopen-after는 0 이상이어야 합니다.')
+        if output.exists():
+            if args.command == 'collect' and record_path.is_file():
+                record = json.loads(record_path.read_text())
+                if record['project'] != config['project'] or record['page'] != config['page']:
+                    raise ReviewError('기록된 프로젝트/탭이 현재 설정과 다릅니다.')
+                if record['status'] in ('answer_ready', 'completed') and 'answer_sha256' in record:
+                    if hashlib.sha256(output.read_bytes()).hexdigest() != record['answer_sha256']:
+                        raise ReviewError('저장된 답변 파일이 변경됐습니다. 덮어쓰지 않습니다.')
+                    record['status'] = 'completed'
+                    save_json(record_path, record)
+                    print(json.dumps(result_json(output, record_path, record), ensure_ascii=False))
+                    return
+            raise ReviewError('출력 파일이 이미 있습니다. 덮어쓰지 않습니다.')
+        if not output.parent.is_dir():
+            raise ReviewError('출력 디렉터리가 없습니다.')
+        if args.command == 'ask':
+            previous_record = None
+            if record_path.exists():
+                previous_record = json.loads(record_path.read_text())
+                if previous_record['status'] == 'send_attempted':
+                    receipt = browser.dispatch_receipt(previous_record)
+                    if receipt is not None:
+                        raise ReviewError('이미 전송을 시도한 요청입니다. collect를 사용하세요.')
+                    if previous_record['model'] != args.model or previous_record['effort'] != args.effort:
+                        raise ReviewError('미확인 요청 재시도에서는 기존 모델/성능을 유지해야 합니다.')
+                elif previous_record['status'] != 'prepared':
+                    raise ReviewError('이미 전송을 시도한 요청입니다. ask로 재전송하지 말고 collect를 사용하세요.')
+                if previous_record['project'] != config['project'] or previous_record['page'] != config['page']:
+                    raise ReviewError('기존 요청의 프로젝트/탭이 현재 설정과 다릅니다.')
+            request_id = previous_record['request_id'] if previous_record is not None else 'LOCAL-REVIEW-' + uuid.uuid4().hex
+            parts = [f'Request-ID: {request_id}', args.question]
+            files = []
+            for file in args.file:
+                part, file_info = file_part(file)
+                parts.append(part)
+                files.append(file_info)
+            prompt = '\n\n'.join(parts)
+            if not args.question.strip() or len(prompt) > args.max_chars:
+                raise ReviewError('질문이 비어 있거나 --max-chars를 초과했습니다.')
+            digest = hashlib.sha256(prompt.encode()).hexdigest()
+            if previous_record is not None and previous_record['prompt_sha256'] != digest:
+                raise ReviewError('기존 요청과 질문/파일 내용이 다릅니다. 별도 --out을 지정하세요.')
+            record = {'request_id': request_id, 'project': config['project'], 'page': config['page'],
+                      'status': 'prepared', 'model': args.model, 'effort': args.effort,
+                      'files': files, 'prompt_sha256': digest,
+                      'reopen_attempts': 0}
+            if previous_record is not None and previous_record['status'] == 'send_attempted':
+                record = previous_record
+            save_json(record_path, record, create=previous_record is None)
+            browser.project(prompt)
+            record['selection'] = browser.select_model(args.model, args.effort)
+            browser.send(prompt, record, record_path)
+        else:
+            record = json.loads(record_path.read_text())
+            if record['project'] != config['project'] or record['page'] != config['page']:
+                raise ReviewError('요청 기록과 현재 설정의 프로젝트/탭이 다릅니다.')
+            if record['status'] not in ('send_attempted', 'answer_ready'):
+                raise ReviewError('전송 시도 기록이 없습니다.')
+            if 'reopen_attempts' not in record:
+                record['reopen_attempts'] = 0
+            if 'conversation' not in record:
+                browser.remember_conversation(record, record_path)
+            if args.reopen:
+                record['reopen_attempts'] += 1
+                save_json(record_path, record)
+            if args.reopen or browser.state()['url'] != record['conversation']:
+                browser.reopen(record)
+        answer, url, response_model, message_id = browser.collect(record, record_path, args.reopen_after)
+        content = answer + '\n'
+        if record['status'] == 'answer_ready' and record['message_id'] != message_id:
+            raise ReviewError('이전에 회수한 응답과 메시지 ID가 다릅니다.')
+        record.update(status='answer_ready', conversation=url, response_model=response_model, message_id=message_id,
+                      answer_sha256=hashlib.sha256(content.encode()).hexdigest())
+        save_json(record_path, record)
+        save_answer(output, content)
+        record['status'] = 'completed'
+        save_json(record_path, record)
+        print(json.dumps(result_json(output, record_path, record), ensure_ascii=False))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (ReviewError, OSError, ValueError, KeyError) as exc:
+        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False), file=sys.stderr)
+        sys.exit(1)
