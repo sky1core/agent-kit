@@ -11,6 +11,7 @@ agent guidance templates를 배포한다.
 - `chatgpt-review`
 - `doc-comment-principles`
 - `operation-guard-hooks`
+- `overnight-mode` — 철야모드
 - `provision-agent-auth`
 - `security-scanners`
 - `skills-management`
@@ -34,8 +35,9 @@ private GitHub repo에서 설치하려면 `gh` 인증이 필요하다.
 스킬은 한 번에 하나씩 user scope로 설치한다.
 `<skill>`에는 위 스킬 이름 중 하나를 넣는다.
 
-GitHub에서 설치:
+GitHub에서 설치하려면 `<owner>/<repo>`에
+[이 저장소](https://github.com/sky1core/agent-kit)의 `OWNER/REPO`를 넣는다:
 
 ```bash
-gh skill install sky1core/agent-kit <skill> --agent <agent> --scope user
+gh skill install <owner>/<repo> <skill> --agent <agent> --scope user
 ```
