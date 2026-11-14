@@ -17,7 +17,7 @@ Rust 코드를 증명할 때 읽는다. 사용할 revision의 공식 문서·실
 
 - target, 정수 폭과 signedness, feature·cfg, 외부 함수 모델을 기록한다. `usize`와 layout 등의 architecture 의존성을 확인한다.
 - Rust의 정수 overflow 동작과 검사 설정, `checked_*`·`wrapping_*`·`saturating_*`, cast·shift·나눗셈의 의미를 수학 명세에 연결한다. 원하는 수학 성질을 얻으려고 wrap이나 panic 경로를 숨기지 않는다.
-- Verus의 exec 코드와 일반 빌드, Creusot의 ghost 제거 후 코드, Aeneas의 생성 모델이 어떤 원본에 대응하는지 확인한다. Creusot의 `#[erasure(...)]` 같은 연결 검사는 해당 기능이 보장하는 범위에서 활용한다.
+- Verus의 exec 코드와 일반 빌드, Creusot의 ghost 제거 후 코드, Aeneas의 생성 모델이 어떤 원본에 대응하는지 확인한다. 제품과 별개로 실행 코드를 재작성하거나 생성된 실행 의미를 치환하지 않는다. 원본의 미지원 영역은 다른 방법으로 검증하거나 미증명으로 남긴다. Creusot의 `#[erasure(...)]` 같은 연결 검사는 해당 기능이 보장하는 범위에서 활용한다.
 - 타입·borrow 검사 통과를 알고리즘 정합성 증명으로 취급하지 않는다. unsafe·FFI가 있으면 실제 증명 경계와 도구의 UB 검출 한계를 확인한다.
 
 근거: [Rust 연산 의미](https://doc.rust-lang.org/reference/expressions/operator-expr.html#overflow), [Creusot erasure](https://guide.creusot.rs/erasure.html), [Creusot 제약](https://guide.creusot.rs/limitations.html), [Kani UB 한계](https://model-checking.github.io/kani/undefined-behaviour.html).
