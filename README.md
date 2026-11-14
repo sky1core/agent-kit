@@ -11,6 +11,7 @@ agent guidance templates를 배포한다.
 - `chatgpt-review`
 - `doc-comment-principles`
 - `operation-guard-hooks`
+- `optimization-principles` — 최적화 원칙
 - `overnight-mode` — 철야모드
 - `provision-agent-auth`
 - `security-scanners`
