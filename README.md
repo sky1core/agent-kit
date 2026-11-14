@@ -10,6 +10,7 @@ agent guidance templates를 배포한다.
 - `agents-local-overlay`
 - `chatgpt-review`
 - `doc-comment-principles`
+- `formal-verification-principles` — 형식 증명 원칙
 - `operation-guard-hooks`
 - `optimization-principles` — 최적화 원칙
 - `overnight-mode` — 철야모드
